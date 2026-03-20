@@ -301,7 +301,7 @@ Output ONLY the formatted digest. No preamble, no commentary, nothing else."""
         for attempt in range(3):
             try:
                 response = client.messages.create(
-                    model="claude-sonnet-4-6",
+                    model="claude-haiku-4-5-20251001",
                     max_tokens=8192,
                     system=scout_system,
                     tools=scout_tools,
