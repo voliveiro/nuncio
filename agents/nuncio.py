@@ -269,32 +269,62 @@ def run_book_scout():
         return "Error: book_preferences.md not found."
     with open(BOOK_PREFERENCES_FILE, 'r') as f:
         preferences = f.read()
+
     today = datetime.datetime.now()
     cutoff = (today - datetime.timedelta(days=30)).strftime("%d %B %Y")
     month_terms = today.strftime("%B %Y")
     prev_month_terms = (today.replace(day=1) - datetime.timedelta(days=1)).strftime("%B %Y")
-    return (
-        f"BOOK_SCOUT_PREFERENCES:\n{preferences}\n\n"
-        f"TODAY'S DATE: {today.strftime('%d %B %Y')}\n"
-        f"RECENCY CUTOFF: Only include books whose reviews or announcements were published on or after {cutoff}. "
-        f"Discard any article, review, or recommendation that is older than this date.\n\n"
-        f"BEGIN SEARCHING NOW. Do not announce your plan — immediately call web_search with your first query. "
-        f"Use web_search to find new and recently reviewed books that match these preferences. "
-        f"Append '{month_terms}' or '{prev_month_terms}' to your search queries to bias results toward recent content "
-        f"(e.g. 'new literary fiction reviews {month_terms}'). "
-        f"Search Publishers Weekly, The Guardian Books, Literary Hub, Tor.com, Locus Magazine, and the New Statesman. "
-        f"Check for new releases by the favourite authors listed. "
-        f"Before including any book, verify the review or announcement date is within the last 30 days — if you cannot confirm the date, skip it. "
-        f"IMPORTANT: Do NOT use fetch_url during book scout searches. Use web_search snippets only — fetching full articles wastes context and causes you to stop early. "
-        f"Run searches across all categories (favourite authors, sci-fi, fantasy, literary fiction, non-fiction) before presenting anything. "
-        f"Only compile the digest once you have gathered enough results to fill 6-10 books. "
-        f"Format each entry as: **Title** — Author (Publisher, date) followed by 2-3 sentences on why it matches Vernie's taste. Nothing more. "
-        f"Once the digest is ready, call complete_book_scout with the full digest text as the 'digest' parameter. Do not present it as text first — pass it directly to complete_book_scout."
-    )
 
-def complete_book_scout(digest):
-    save_book_scout_timestamp()
-    return digest
+    scout_system = f"""You are a specialist book research agent. Your sole task is to find new and recently reviewed books matching the reading preferences provided.
+
+Today's date is {today.strftime('%d %B %Y')}.
+Recency cutoff: only include books with reviews or announcements published on or after {cutoff}. Skip anything older — if you cannot confirm the date, skip it.
+
+Search Publishers Weekly, The Guardian Books, Literary Hub, Tor.com, Locus Magazine, and the New Statesman.
+Append '{month_terms}' or '{prev_month_terms}' to search queries to bias toward recent content.
+Check for new releases by the favourite authors listed in the preferences.
+Search across all categories (favourite authors, sci-fi, fantasy, literary fiction, non-fiction) before compiling anything.
+Only compile the digest once you have 6–10 confirmed books within the recency window.
+
+Format each entry as: **Title** — Author (Publisher, date) followed by 2–3 sentences on why it matches Vernie's taste.
+Output ONLY the formatted digest. No preamble, no commentary, nothing else."""
+
+    scout_messages = [{
+        "role": "user",
+        "content": [{"type": "text", "text": f"Find new book recommendations based on these preferences:\n\n{preferences}"}]
+    }]
+    scout_tools = [{"type": "web_search_20250305", "name": "web_search"}]
+
+    print("[Book Scout agent starting...]")
+    MAX_ITERATIONS = 30
+    for _ in range(MAX_ITERATIONS):
+        for attempt in range(3):
+            try:
+                response = client.messages.create(
+                    model="claude-sonnet-4-6",
+                    max_tokens=8192,
+                    system=scout_system,
+                    tools=scout_tools,
+                    messages=scout_messages
+                )
+                break
+            except anthropic.APIStatusError as e:
+                if e.status_code == 529 and attempt < 2:
+                    time.sleep(15)
+                else:
+                    raise
+
+        if response.stop_reason == "end_turn":
+            digest = "".join(b.text for b in response.content if b.type == "text")
+            save_book_scout_timestamp()
+            print("[Book Scout agent complete.]")
+            return digest
+
+        else:
+            print(f"[Book Scout] unexpected stop_reason: {response.stop_reason}")
+            break
+
+    return "Book scout did not complete — please try again."
 
 
 # --- Tool Definitions ---
@@ -461,21 +491,10 @@ tools = [
     },
     {
         "name": "run_book_scout",
-        "description": "Run the weekly book scout. Loads Vernie's reading preferences and returns instructions for searching for new book recommendations. After calling this, use web_search and fetch_url to find books, then present a digest. Call this when Vernie asks for the book search, or when she confirms she wants it run.",
+        "description": "Run the weekly book scout. Spins up a specialist search agent that finds new and recently reviewed books matching Vernie's preferences, then returns a formatted digest. Call this when Vernie asks for the book search, or when she confirms she wants it run.",
         "input_schema": {
             "type": "object",
             "properties": {}
-        }
-    },
-    {
-        "name": "complete_book_scout",
-        "description": "Call this to present the completed book scout digest to Vernie and reset the weekly timer. Pass the full formatted digest as the 'digest' parameter — this is what Vernie will see. Do not summarise or truncate it.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "digest": {"type": "string", "description": "The full book scout digest to present to Vernie, formatted with one entry per book: **Title** — Author (Publisher, date) followed by 2-3 sentences on why it matches her taste."}
-            },
-            "required": ["digest"]
         }
     },
     {
@@ -519,8 +538,6 @@ def execute_tool(tool_name, tool_input):
         return fetch_url(tool_input["url"])
     elif tool_name == "run_book_scout":
         return run_book_scout()
-    elif tool_name == "complete_book_scout":
-        return complete_book_scout(tool_input["digest"])
     return "Tool not found."
 
 # --- Main Loop ---
@@ -543,7 +560,7 @@ You have access to a local inbox folder at /home/vernie/nuncio/nuncio-inbox. Use
 
 ## Book Scout
 {_book_scout_status}
-When Vernie asks for a book search, or confirms she wants one, call the run_book_scout tool first. It will return her preferences, instructions, and the recency cutoff date. Then use web_search — NOT fetch_url — to find recommendations across multiple categories before presenting anything. Only include books whose reviews or announcements are from the past 30 days. Do not present results until you have gathered enough for a full digest of 6-10 books. Each entry: title, author, 2-3 sentences max.
+When Vernie asks for a book search, or confirms she wants one, call the run_book_scout tool. It will spin up a specialist search agent that does all the research and returns a formatted digest — you do not need to search yourself. Present the digest to Vernie as-is when it arrives.
 """
 
 print("Serviam! Nuncio is ready. Type 'exit' to quit.\n")
@@ -585,9 +602,7 @@ while True:
                     print(f"[Nuncio is using tool: {block.name}]")
                     result = execute_tool(block.name, block.input)
                     SILENT_TOOLS = {"run_book_scout"}
-                    if block.name == "complete_book_scout":
-                        print(f"\nNuncio: {result}\n")
-                    elif block.name not in SILENT_TOOLS:
+                    if block.name not in SILENT_TOOLS:
                         print(f"[Tool result for {block.name}]: {result}")
 
                     MAX_TOOL_RESULT_LENGTH = 10000
