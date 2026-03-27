@@ -15,8 +15,8 @@ from googleapiclient.http import MediaIoBaseUpload
 CONFIRMATION_REQUIRED = {"send_email", "create_calendar_event", "create_multiple_events", "upload_to_drive", "remember", "delete_memory"}
 
 # --- Config ---
-CREDS_FILE = '/home/vernie/nuncio/keys/google_credentials.json'
-TOKEN_FILE = '/home/vernie/nuncio/keys/google_token.json'
+CREDS_FILE = os.path.join(os.path.dirname(__file__), '..', 'keys', 'google_credentials.json')
+TOKEN_FILE = os.path.join(os.path.dirname(__file__), '..', 'keys', 'google_token.json')
 
 SCOPES = [
     'https://www.googleapis.com/auth/calendar',
@@ -26,7 +26,7 @@ SCOPES = [
     'https://www.googleapis.com/auth/drive.readonly'
 ]
 
-NUNCIO_FOLDER ='/home/vernie/nuncio/nuncio-inbox'
+NUNCIO_FOLDER = os.path.join(os.path.dirname(__file__), '..', 'nuncio-inbox')
 
 # --- Error classification helper ---
 def _classify_error(e):
@@ -57,9 +57,9 @@ def _classify_error(e):
 
 # --- History ---
 
-HISTORY_FILE = '/home/vernie/nuncio/logs/conversation_history.json'
-BOOK_SCOUT_FILE = '/home/vernie/nuncio/logs/book_scout_last_run.txt'
-BOOK_PREFERENCES_FILE = '/home/vernie/nuncio/agents/book_preferences.md'
+HISTORY_FILE = os.path.join(os.path.dirname(__file__), '..', 'logs', 'conversation_history.json')
+BOOK_SCOUT_FILE = os.path.join(os.path.dirname(__file__), '..', 'logs', 'book_scout_last_run.txt')
+BOOK_PREFERENCES_FILE = os.path.join(os.path.dirname(__file__), 'book_preferences.md')
 
 def load_history():
     if os.path.exists(HISTORY_FILE):
@@ -459,7 +459,7 @@ Output ONLY the formatted digest. No preamble, no commentary, nothing else."""
 
 
 # --- Action Log ---
-ACTION_LOG_FILE = '/home/vernie/nuncio/logs/action_log.jsonl'
+ACTION_LOG_FILE = os.path.join(os.path.dirname(__file__), '..', 'logs', 'action_log.jsonl')
 MEMORY_FILE = MEMORY_FILE = os.path.join(os.path.dirname(__file__), '..', 'logs', 'memory.json')
 
 def append_action_log(tool_name, tool_input, result, confirmation_status):
@@ -913,7 +913,7 @@ You can search the web and fetch URLs to find current information, news, and res
 Use your tools whenever a question requires real data.
 Always tell Vernie what you found, not just that you looked.
 When sending any email, always prefix the subject line with "[Nuncio] " and append the following line at the very bottom of the email body: "Email sent by Nuncio, Vernie's agent".
-You have access to a local inbox folder at /home/vernie/nuncio/nuncio-inbox. Use the list_files tool to see what files are inside it. Only use read_file on specific files returned by list_files, never on folder paths.
+You have access to a local inbox folder at {NUNCIO_FOLDER}. Use the list_files tool to see what files are inside it. Only use read_file on specific files returned by list_files, never on folder paths.
 
 ## Book Scout
 {_book_scout_status}
