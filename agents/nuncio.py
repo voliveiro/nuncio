@@ -11,7 +11,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
-CONFIRMATION_REQUIRED = {"send_email", "create_calendar_event", "create_multiple_events", "upload_to_drive"}
+CONFIRMATION_REQUIRED = {"send_email", "create_calendar_event", "create_multiple_events", "upload_to_drive", "remember", "delete_memory"}
 
 # --- Config ---
 CREDS_FILE = '/home/vernie/nuncio/keys/google_credentials.json'
@@ -459,6 +459,7 @@ Output ONLY the formatted digest. No preamble, no commentary, nothing else."""
 
 # --- Action Log ---
 ACTION_LOG_FILE = '/home/vernie/nuncio/logs/action_log.jsonl'
+MEMORY_FILE = '/home/vernie/nuncio/logs/memory.json'
 
 def append_action_log(tool_name, tool_input, result, confirmation_status):
     entry = {
@@ -470,6 +471,90 @@ def append_action_log(tool_name, tool_input, result, confirmation_status):
     }
     with open(ACTION_LOG_FILE, 'a') as f:
         f.write(json.dumps(entry) + '\n')
+
+
+# --- Memory Store ---
+
+ALLOWED_MEMORY_CATEGORIES = {"contact", "project", "preference", "standing_instruction"}
+
+def load_memory():
+    if not os.path.exists(MEMORY_FILE):
+        with open(MEMORY_FILE, 'w') as f:
+            json.dump([], f)
+        return []
+    try:
+        with open(MEMORY_FILE, 'r') as f:
+            return json.load(f)
+    except (json.JSONDecodeError, ValueError):
+        return []
+
+def save_memory(memories):
+    with open(MEMORY_FILE, 'w') as f:
+        json.dump(memories, f, indent=2, default=str)
+
+def remember(key, value, category, source, url=None):
+    if category not in ALLOWED_MEMORY_CATEGORIES:
+        return f"Error: category '{category}' is not allowed. Must be one of: {', '.join(sorted(ALLOWED_MEMORY_CATEGORIES))}."
+    memories = load_memory()
+    numbered = [int(m['id'].split('_')[1]) for m in memories if m.get('id', '').startswith('mem_') and m['id'].split('_')[1].isdigit()]
+    new_id = f"mem_{(max(numbered) + 1):03d}" if numbered else "mem_001"
+    entry = {
+        "id": new_id,
+        "key": key,
+        "value": value,
+        "category": category,
+        "source": source,
+        "timestamp": datetime.datetime.now().isoformat(),
+        "url": url if source == "external_url" else None,
+    }
+    memories.append(entry)
+    save_memory(memories)
+    return f"Memory saved with id {new_id}: [{category}] {key} = {value}"
+
+def recall(query):
+    memories = load_memory()
+    q = query.lower()
+    matches = [m for m in memories if q in m.get('key', '').lower() or q in m.get('value', '').lower()]
+    if not matches:
+        return f"No memories found matching '{query}'."
+    lines = [f"Found {len(matches)} memory/memories matching '{query}':\n"]
+    for m in matches:
+        lines.append(f"[{m['id']}] ({m['category']}) {m['key']}: {m['value']}")
+        lines.append(f"  source: {m['source']} | {m['timestamp']}")
+        if m.get('url'):
+            lines.append(f"  url: {m['url']}")
+    return "\n".join(lines)
+
+def list_memories():
+    memories = load_memory()
+    if not memories:
+        return "No memories stored yet."
+    lines = [f"Stored memories ({len(memories)} total):\n"]
+    for m in memories:
+        lines.append(f"[{m['id']}] ({m['category']}) {m['key']}: {m['value']}")
+        lines.append(f"  source: {m['source']} | {m['timestamp']}")
+        if m.get('url'):
+            lines.append(f"  url: {m['url']}")
+    return "\n".join(lines)
+
+def delete_memory(memory_id):
+    memories = load_memory()
+    original_count = len(memories)
+    memories = [m for m in memories if m.get('id') != memory_id]
+    if len(memories) == original_count:
+        return f"Error: no memory found with id '{memory_id}'."
+    save_memory(memories)
+    return f"Memory '{memory_id}' deleted."
+
+def load_memory_for_prompt():
+    memories = load_memory()
+    trusted = [m for m in memories if m.get('source') in ('user_stated', 'inferred_from_conversation')]
+    if not trusted:
+        return "## Memory\nNo stored memories yet."
+    lines = ["## Memory"]
+    for m in trusted:
+        lines.append(f"[{m['id']}] ({m['category']}) {m['key']}: {m['value']}  [{m['source']}]")
+    return "\n".join(lines)
 
 
 # --- Tool Definitions ---
@@ -693,6 +778,51 @@ tools = [
         }
     },
     {
+        "name": "remember",
+        "description": "Store a fact in persistent memory. Use this to save things Vernie tells you about contacts, projects, preferences, or standing instructions.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Short label for this memory, e.g. 'preferred_sign_off' or 'contact_role'"},
+                "value": {"type": "string", "description": "The fact to store"},
+                "category": {"type": "string", "description": "One of: contact, project, preference, standing_instruction"},
+                "source": {"type": "string", "description": "One of: user_stated, inferred_from_conversation, external_url"},
+                "url": {"type": "string", "description": "Source URL — required if source is external_url, otherwise omit"}
+            },
+            "required": ["key", "value", "category", "source"]
+        }
+    },
+    {
+        "name": "recall",
+        "description": "Search persistent memory for entries matching a query. Returns all entries where the query appears in the key or value.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search term to look for in memory keys and values"}
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "list_memories",
+        "description": "List all entries in persistent memory, showing id, key, value, category, source, and timestamp.",
+        "input_schema": {
+            "type": "object",
+            "properties": {}
+        }
+    },
+    {
+        "name": "delete_memory",
+        "description": "Delete a memory entry by its id (e.g. mem_001). Use list_memories to find the id first.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "The id of the memory entry to delete, e.g. mem_001"}
+            },
+            "required": ["id"]
+        }
+    },
+    {
         "type": "web_search_20250305",
         "name": "web_search",
     },
@@ -743,14 +873,32 @@ def execute_tool(tool_name, tool_input):
         return fetch_url(tool_input["url"])
     elif tool_name == "run_book_scout":
         return run_book_scout()
+    elif tool_name == "remember":
+        return remember(
+            tool_input["key"],
+            tool_input["value"],
+            tool_input["category"],
+            tool_input["source"],
+            tool_input.get("url")
+        )
+    elif tool_name == "recall":
+        return recall(tool_input["query"])
+    elif tool_name == "list_memories":
+        return list_memories()
+    elif tool_name == "delete_memory":
+        return delete_memory(tool_input["id"])
     return "Tool not found."
 
-# --- Main Loop ---
+# --- Anthropic client (module-level so run_book_scout can use it when imported) ---
 client = anthropic.Anthropic()
-conversation_history = load_history()
-_book_scout_status = book_scout_prompt_fragment()
 
-system_prompt = f"""You are Nuncio, an AI agent with delegated authority to act on behalf of your principal, Vernie.
+# --- Main Loop ---
+if __name__ == "__main__":
+    conversation_history = load_history()
+    _book_scout_status = book_scout_prompt_fragment()
+    _memory_section = load_memory_for_prompt()
+
+    system_prompt = f"""You are Nuncio, an AI agent with delegated authority to act on behalf of your principal, Vernie.
 Today's date is {datetime.datetime.now().strftime("%A, %d %B %Y")}.
 You are precise, loyal, and operate within clearly defined boundaries.
 You are informed by Jesuit Catholic values.
@@ -764,118 +912,121 @@ You have access to a local inbox folder at /home/vernie/nuncio/nuncio-inbox. Use
 ## Book Scout
 {_book_scout_status}
 When Vernie asks for a book search, or confirms she wants one, call the run_book_scout tool. It will spin up a specialist search agent that does all the research and returns a formatted digest — you do not need to search yourself. Present the digest to Vernie as-is when it arrives.
+
+{_memory_section}
 """
 
-print("Serviam! Nuncio is ready. Type 'exit' to quit.\n")
-
-while True:
-    user_input = input("You: ")
-
-    if user_input.lower() == "exit":
-        print("Ite in pace. Nuncio signing off.")
-        break
-
-    conversation_history.append({
-        "role": "user",
-        "content": [{"type": "text", "text": user_input}]
-    })
-
-    tool_call_counts = {}
-    MAX_TOOL_RETRIES = 3
+    print("Serviam! Nuncio is ready. Type 'exit' to quit.\n")
 
     while True:
-        for attempt in range(3):
-            try:
-                response = client.messages.create(
-                    model="claude-sonnet-4-6",
-                    max_tokens=4096,
-                    system=system_prompt,
-                    tools=tools,
-                    messages=conversation_history
-                )
-                break
-            except anthropic.APIStatusError as e:
-                if e.status_code == 529 and attempt < 2:
-                    print(f"[Nuncio] API overloaded, retrying in 15 seconds... (attempt {attempt + 1}/3)")
-                    time.sleep(15)
-                else:
-                    raise
+        user_input = input("You: ")
 
-        if response.stop_reason == "tool_use":
-            tool_results = []
-            SILENT_TOOLS = {"run_book_scout"}
-            for block in response.content:
-                if block.type == "tool_use":
-                    tool_name = block.name
-                    tool_input = block.input
+        if user_input.lower() == "exit":
+            print("Ite in pace. Nuncio signing off.")
+            break
 
-                    if tool_name in CONFIRMATION_REQUIRED:
-                        print(f"\n[Nuncio wants to use tool: {tool_name}]")
-                        print(json.dumps(tool_input, indent=2))
-                        answer = input("Confirm? (yes/no): ").strip().lower()
-                        if answer != "yes":
-                            result = "Action cancelled by user."
-                            confirmation_status = "denied"
-                            append_action_log(tool_name, tool_input, result, confirmation_status)
-                        else:
-                            confirmation_status = "granted"
+        conversation_history.append({
+            "role": "user",
+            "content": [{"type": "text", "text": user_input}]
+        })
+
+        tool_call_counts = {}
+        MAX_TOOL_RETRIES = 3
+
+        while True:
+            for attempt in range(3):
+                try:
+                    response = client.messages.create(
+                        model="claude-sonnet-4-6",
+                        max_tokens=4096,
+                        system=system_prompt,
+                        tools=tools,
+                        messages=conversation_history
+                    )
+                    break
+                except anthropic.APIStatusError as e:
+                    if e.status_code == 529 and attempt < 2:
+                        print(f"[Nuncio] API overloaded, retrying in 15 seconds... (attempt {attempt + 1}/3)")
+                        time.sleep(15)
                     else:
-                        confirmation_status = "not_required"
+                        raise
 
-                    if confirmation_status in ("granted", "not_required"):
-                        tool_call_counts[tool_name] = tool_call_counts.get(tool_name, 0) + 1
-                        if tool_call_counts[tool_name] > MAX_TOOL_RETRIES:
-                            result = json.dumps({
-                                "status": "error",
-                                "reason": "retry_limit_reached",
-                                "retryable": False,
-                                "detail": f"{tool_name} has been called {tool_call_counts[tool_name]} times this turn. Stopping. Report this failure to Vernie and do not retry."
-                            })
-                            append_action_log(tool_name, tool_input, result, confirmation_status)
+            if response.stop_reason == "tool_use":
+                tool_results = []
+                SILENT_TOOLS = {"run_book_scout"}
+                for block in response.content:
+                    if block.type == "tool_use":
+                        tool_name = block.name
+                        tool_input = block.input
+
+                        if tool_name in CONFIRMATION_REQUIRED:
+                            print(f"\n[Nuncio wants to use tool: {tool_name}]")
+                            print(json.dumps(tool_input, indent=2))
+                            if tool_name == "remember" and tool_input.get("source") == "external_url":
+                                print("⚠ This memory was derived from external content. Verify before confirming.")
+                            answer = input("Confirm? (yes/no): ").strip().lower()
+                            if answer != "yes":
+                                result = "Action cancelled by user."
+                                confirmation_status = "denied"
+                                append_action_log(tool_name, tool_input, result, confirmation_status)
+                            else:
+                                confirmation_status = "granted"
                         else:
-                            print(f"[Nuncio is using tool: {tool_name}]")
-                            result = execute_tool(tool_name, tool_input)
-                            if tool_name not in SILENT_TOOLS:
-                                print(f"[Tool result for {tool_name}]: {result}")
-                            append_action_log(tool_name, tool_input, result, confirmation_status)
+                            confirmation_status = "not_required"
 
-                    MAX_TOOL_RESULT_LENGTH = 10000
-                    if isinstance(result, str) and len(result) > MAX_TOOL_RESULT_LENGTH:
-                        history_result = result[:MAX_TOOL_RESULT_LENGTH] + "\n[...truncated for history...]"
-                    else:
-                        history_result = result
+                        if confirmation_status in ("granted", "not_required"):
+                            tool_call_counts[tool_name] = tool_call_counts.get(tool_name, 0) + 1
+                            if tool_call_counts[tool_name] > MAX_TOOL_RETRIES:
+                                result = json.dumps({
+                                    "status": "error",
+                                    "reason": "retry_limit_reached",
+                                    "retryable": False,
+                                    "detail": f"{tool_name} has been called {tool_call_counts[tool_name]} times this turn. Stopping. Report this failure to Vernie and do not retry."
+                                })
+                                append_action_log(tool_name, tool_input, result, confirmation_status)
+                            else:
+                                print(f"[Nuncio is using tool: {tool_name}]")
+                                result = execute_tool(tool_name, tool_input)
+                                if tool_name not in SILENT_TOOLS:
+                                    print(f"[Tool result for {tool_name}]: {result}")
+                                append_action_log(tool_name, tool_input, result, confirmation_status)
 
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": history_result
-                    })
+                        MAX_TOOL_RESULT_LENGTH = 10000
+                        if isinstance(result, str) and len(result) > MAX_TOOL_RESULT_LENGTH:
+                            history_result = result[:MAX_TOOL_RESULT_LENGTH] + "\n[...truncated for history...]"
+                        else:
+                            history_result = result
 
-                    
-            serialized = []
-            for block in response.content:
-                if block.type == "text" and block.text:
-                    serialized.append({"type": "text", "text": block.text})
-                elif block.type == "tool_use":
-                    serialized.append({"type": "tool_use", "id": block.id, "name": block.name, "input": block.input})
-            conversation_history.append({
-                "role": "assistant",
-                "content": serialized
-            })
-            conversation_history.append({
-                "role": "user",
-                "content": tool_results
-            })
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": history_result
+                        })
 
-        else:
-            reply = next((b.text for b in response.content if b.type == "text"), "")
-            if reply:
+                serialized = []
+                for block in response.content:
+                    if block.type == "text" and block.text:
+                        serialized.append({"type": "text", "text": block.text})
+                    elif block.type == "tool_use":
+                        serialized.append({"type": "tool_use", "id": block.id, "name": block.name, "input": block.input})
                 conversation_history.append({
                     "role": "assistant",
-                    "content": [{"type": "text", "text": reply}]
+                    "content": serialized
                 })
-                print(f"\nNuncio: {reply}\n")
+                conversation_history.append({
+                    "role": "user",
+                    "content": tool_results
+                })
+
             else:
-                print("[Nuncio completed action with no text response]\n")
-            save_history(conversation_history)
-            break
+                reply = next((b.text for b in response.content if b.type == "text"), "")
+                if reply:
+                    conversation_history.append({
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": reply}]
+                    })
+                    print(f"\nNuncio: {reply}\n")
+                else:
+                    print("[Nuncio completed action with no text response]\n")
+                save_history(conversation_history)
+                break

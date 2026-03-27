@@ -218,6 +218,9 @@ keys/
 # Conversation history
 conversation_history.json
 
+# Logs (runtime data, memory, action log)
+logs/
+
 # Nuncio inbox and all subfolders
 nuncio-inbox/
 
