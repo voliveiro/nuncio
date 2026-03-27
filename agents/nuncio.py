@@ -11,6 +11,8 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
+CONFIRMATION_REQUIRED = {"send_email", "create_calendar_event", "create_multiple_events", "upload_to_drive"}
+
 # --- Config ---
 CREDS_FILE = '/home/vernie/nuncio/keys/google_credentials.json'
 TOKEN_FILE = '/home/vernie/nuncio/keys/google_token.json'
@@ -24,6 +26,33 @@ SCOPES = [
 ]
 
 NUNCIO_FOLDER ='/home/vernie/nuncio/nuncio-inbox'
+
+# --- Error classification helper ---
+def _classify_error(e):
+    """Returns (reason, retryable) for structured error responses."""
+    if isinstance(e, (FileNotFoundError, IsADirectoryError)):
+        return "file_not_found", False
+    if isinstance(e, PermissionError):
+        return "permission_error", False
+    if isinstance(e, (requests.exceptions.Timeout,)):
+        return "network_or_timeout_error", True
+    if isinstance(e, requests.exceptions.ConnectionError):
+        return "network_or_timeout_error", True
+    if isinstance(e, requests.exceptions.HTTPError):
+        status = e.response.status_code if e.response is not None else 0
+        if 400 <= status < 500:
+            return f"http_{status}_error", False
+        return f"http_{status}_error", True
+    try:
+        from googleapiclient.errors import HttpError
+        if isinstance(e, HttpError):
+            status = int(e.resp.status)
+            if 400 <= status < 500:
+                return f"http_{status}_error", False
+            return f"http_{status}_error", True
+    except ImportError:
+        pass
+    return "unknown_error", True
 
 # --- History ---
 
@@ -94,26 +123,30 @@ def get_credentials():
 
 # --- Calendar Tool ---
 def get_calendar_events(query=None):
-    creds = get_credentials()
-    service = build('calendar', 'v3', credentials=creds)
-    now = datetime.datetime.utcnow().isoformat() + 'Z'
-    events_result = service.events().list(
-        calendarId='primary',
-        timeMin=now,
-        maxResults=20,
-        singleEvents=True,
-        orderBy='startTime'
-    ).execute()
-    events = events_result.get('items', [])
-    if query:
-        events = [e for e in events if query.lower() in e.get('summary', '').lower() or query.lower() in e.get('description', '').lower()]
-    if not events:
-        return "No upcoming events found."
-    result = ""
-    for event in events:
-        start = event['start'].get('dateTime', event['start'].get('date'))
-        result += f"{start}: {event['summary']}\n"
-    return result
+    try:
+        creds = get_credentials()
+        service = build('calendar', 'v3', credentials=creds)
+        now = datetime.datetime.utcnow().isoformat() + 'Z'
+        events_result = service.events().list(
+            calendarId='primary',
+            timeMin=now,
+            maxResults=20,
+            singleEvents=True,
+            orderBy='startTime'
+        ).execute()
+        events = events_result.get('items', [])
+        if query:
+            events = [e for e in events if query.lower() in e.get('summary', '').lower() or query.lower() in e.get('description', '').lower()]
+        if not events:
+            return "No upcoming events found."
+        result = ""
+        for event in events:
+            start = event['start'].get('dateTime', event['start'].get('date'))
+            result += f"{start}: {event['summary']}\n"
+        return result
+    except Exception as e:
+        reason, retryable = _classify_error(e)
+        return json.dumps({"status": "error", "reason": reason, "retryable": retryable, "detail": str(e)})
 
 def create_calendar_event(summary, start_datetime, end_datetime, description=None):
     creds = get_credentials()
@@ -145,21 +178,25 @@ def create_multiple_events(events_list):
 
 # --- Gmail Tool ---
 def get_recent_emails(query=None):
-    creds = get_credentials()
-    service = build('gmail', 'v1', credentials=creds)
-    q = query if query else ''
-    results = service.users().messages().list(userId='me', maxResults=5, q=q).execute()
-    messages = results.get('messages', [])
-    if not messages:
-        return "No emails found."
-    result = ""
-    for msg in messages:
-        txt = service.users().messages().get(userId='me', id=msg['id']).execute()
-        headers = txt['payload']['headers']
-        subject = next((h['value'] for h in headers if h['name'] == 'Subject'), 'No Subject')
-        sender = next((h['value'] for h in headers if h['name'] == 'From'), 'Unknown')
-        result += f"From: {sender}\nSubject: {subject}\n\n"
-    return result
+    try:
+        creds = get_credentials()
+        service = build('gmail', 'v1', credentials=creds)
+        q = query if query else ''
+        results = service.users().messages().list(userId='me', maxResults=5, q=q).execute()
+        messages = results.get('messages', [])
+        if not messages:
+            return "No emails found."
+        result = ""
+        for msg in messages:
+            txt = service.users().messages().get(userId='me', id=msg['id']).execute()
+            headers = txt['payload']['headers']
+            subject = next((h['value'] for h in headers if h['name'] == 'Subject'), 'No Subject')
+            sender = next((h['value'] for h in headers if h['name'] == 'From'), 'Unknown')
+            result += f"From: {sender}\nSubject: {subject}\n\n"
+        return result
+    except Exception as e:
+        reason, retryable = _classify_error(e)
+        return json.dumps({"status": "error", "reason": reason, "retryable": retryable, "detail": str(e)})
 
 def send_email(to, subject, body):
     import base64
@@ -175,22 +212,26 @@ def send_email(to, subject, body):
 
 # --- Drive Tools ---
 def list_drive_files(query=None):
-    creds = get_credentials()
-    service = build('drive', 'v3', credentials=creds)
-    q = f"name contains '{query}'" if query else ""
-    results = service.files().list(
-        pageSize=20,
-        orderBy='modifiedTime desc',
-        q=q,
-        fields="files(id, name, mimeType, modifiedTime)"
-    ).execute()
-    files = results.get('files', [])
-    if not files:
-        return "No files found."
-    result = f"Found {len(files)} files:\n\n"
-    for f in files:
-        result += f"{f['modifiedTime']}: {f['name']} ({f['mimeType']})\n"
-    return result
+    try:
+        creds = get_credentials()
+        service = build('drive', 'v3', credentials=creds)
+        q = f"name contains '{query}'" if query else ""
+        results = service.files().list(
+            pageSize=20,
+            orderBy='modifiedTime desc',
+            q=q,
+            fields="files(id, name, mimeType, modifiedTime)"
+        ).execute()
+        files = results.get('files', [])
+        if not files:
+            return "No files found."
+        result = f"Found {len(files)} files:\n\n"
+        for f in files:
+            result += f"{f['modifiedTime']}: {f['name']} ({f['mimeType']})\n"
+        return result
+    except Exception as e:
+        reason, retryable = _classify_error(e)
+        return json.dumps({"status": "error", "reason": reason, "retryable": retryable, "detail": str(e)})
 
 def upload_to_drive(filename, content):
     creds = get_credentials()
@@ -225,29 +266,117 @@ def write_file(filepath, content):
     return f"File written to {filepath}"
 
 def read_file(filepath):
-    if os.path.isdir(filepath):
-        return f"Error: '{filepath}' is a directory, not a file. Use list_files to see its contents."
-    if not os.path.exists(filepath):
-        return f"File not found: {filepath}"
-    with open(filepath, 'r') as f:
-        return f.read()
+    try:
+        if os.path.isdir(filepath):
+            return json.dumps({"status": "error", "reason": "path_is_directory", "retryable": False, "detail": f"'{filepath}' is a directory, not a file. Use list_files to see its contents."})
+        with open(filepath, 'r') as f:
+            return f.read()
+    except FileNotFoundError as e:
+        return json.dumps({"status": "error", "reason": "file_not_found", "retryable": False, "detail": str(e)})
+    except PermissionError as e:
+        return json.dumps({"status": "error", "reason": "permission_error", "retryable": False, "detail": str(e)})
+    except Exception as e:
+        reason, retryable = _classify_error(e)
+        return json.dumps({"status": "error", "reason": reason, "retryable": retryable, "detail": str(e)})
     
 def read_pdf(filepath):
     import fitz
-    if not os.path.exists(filepath):
-        return f"File not found: {filepath}"
-    doc = fitz.open(filepath)
-    result = ""
-    for page in doc:
-        result += page.get_text()
-    return result
+    try:
+        if not os.path.exists(filepath):
+            return json.dumps({"status": "error", "reason": "file_not_found", "retryable": False, "detail": f"File not found: {filepath}"})
+        doc = fitz.open(filepath)
+        result = ""
+        for page in doc:
+            result += page.get_text()
+        return result
+    except PermissionError as e:
+        return json.dumps({"status": "error", "reason": "permission_error", "retryable": False, "detail": str(e)})
+    except Exception as e:
+        reason, retryable = _classify_error(e)
+        return json.dumps({"status": "error", "reason": reason, "retryable": retryable, "detail": str(e)})
 
 def read_docx(filepath):
     from docx import Document
-    if not os.path.exists(filepath):
-        return f"File not found: {filepath}"
-    doc = Document(filepath)
-    return "\n".join([para.text for para in doc.paragraphs])
+    try:
+        if not os.path.exists(filepath):
+            return json.dumps({"status": "error", "reason": "file_not_found", "retryable": False, "detail": f"File not found: {filepath}"})
+        doc = Document(filepath)
+        return "\n".join([para.text for para in doc.paragraphs])
+    except PermissionError as e:
+        return json.dumps({"status": "error", "reason": "permission_error", "retryable": False, "detail": str(e)})
+    except Exception as e:
+        reason, retryable = _classify_error(e)
+        return json.dumps({"status": "error", "reason": reason, "retryable": retryable, "detail": str(e)})
+
+# --- Browser session (persistent across tool calls) ---
+_playwright_instance = None
+_browser_instance = None
+_page_instance = None
+
+def _get_page():
+    global _playwright_instance, _browser_instance, _page_instance
+    from playwright.sync_api import sync_playwright
+    if _playwright_instance is None:
+        _playwright_instance = sync_playwright().start()
+        _browser_instance = _playwright_instance.chromium.launch(headless=False)
+        _page_instance = _browser_instance.new_page()
+    return _page_instance
+
+def browser_navigate(url):
+    try:
+        page = _get_page()
+        page.goto(url, timeout=15000)
+        return f"Navigated to: {page.title()}"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+def browser_fill(label, text):
+    try:
+        page = _get_page()
+        page.get_by_placeholder(label).fill(text)
+        return f"Filled '{label}' with '{text}'"
+    except Exception:
+        try:
+            page.get_by_label(label).fill(text)
+            return f"Filled '{label}' with '{text}'"
+        except Exception as e:
+            return f"Could not find field '{label}': {str(e)}"
+
+def browser_click(text):
+    try:
+        page = _get_page()
+        page.get_by_role("button", name=text).click()
+        return f"Clicked button '{text}'"
+    except Exception:
+        try:
+            page.get_by_text(text).first.click()
+            return f"Clicked '{text}'"
+        except Exception as e:
+            return f"Could not click '{text}': {str(e)}"
+
+def browser_read():
+    try:
+        page = _get_page()
+        title = page.title()
+        text = page.inner_text("body")
+        text = text[:5000] if len(text) > 5000 else text
+        return f"Title: {title}\n\n{text}"
+    except Exception as e:
+        return f"Error reading page: {str(e)}"
+
+def browser_close():
+    global _playwright_instance, _browser_instance, _page_instance
+    try:
+        if _browser_instance:
+            _browser_instance.close()
+        if _playwright_instance:
+            _playwright_instance.stop()
+        _playwright_instance = None
+        _browser_instance = None
+        _page_instance = None
+        return "Browser closed."
+    except Exception as e:
+        return f"Error closing browser: {str(e)}"
 
 def fetch_url(url):
     try:
@@ -262,7 +391,8 @@ def fetch_url(url):
         # Trim to avoid blowing the context window
         return text[:8000] if len(text) > 8000 else text
     except Exception as e:
-        return f"Error fetching URL: {str(e)}"
+        reason, retryable = _classify_error(e)
+        return json.dumps({"status": "error", "reason": reason, "retryable": retryable, "detail": str(e)})
 
 def run_book_scout():
     if not os.path.exists(BOOK_PREFERENCES_FILE):
@@ -325,6 +455,21 @@ Output ONLY the formatted digest. No preamble, no commentary, nothing else."""
             break
 
     return "Book scout did not complete — please try again."
+
+
+# --- Action Log ---
+ACTION_LOG_FILE = '/home/vernie/nuncio/logs/action_log.jsonl'
+
+def append_action_log(tool_name, tool_input, result, confirmation_status):
+    entry = {
+        "timestamp": datetime.datetime.now().isoformat(),
+        "tool": tool_name,
+        "input": tool_input,
+        "result_preview": str(result)[:300],
+        "confirmation": confirmation_status,
+    }
+    with open(ACTION_LOG_FILE, 'a') as f:
+        f.write(json.dumps(entry) + '\n')
 
 
 # --- Tool Definitions ---
@@ -479,6 +624,56 @@ tools = [
         }
     },
     {
+        "name": "browser_navigate",
+        "description": "Open a URL in a headless Chromium browser. Use this to start a browsing session or navigate to a new page.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "The full URL to open, including https://"}
+            },
+            "required": ["url"]
+        }
+    },
+    {
+        "name": "browser_fill",
+        "description": "Type text into a form field identified by its placeholder or label text. Use after browser_navigate.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "label": {"type": "string", "description": "The placeholder or label text of the field to fill"},
+                "text": {"type": "string", "description": "The text to type into the field"}
+            },
+            "required": ["label", "text"]
+        }
+    },
+    {
+        "name": "browser_click",
+        "description": "Click a button or link on the current page by its visible text.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "The visible text of the button or link to click"}
+            },
+            "required": ["text"]
+        }
+    },
+    {
+        "name": "browser_read",
+        "description": "Read the title and text content of the current browser page.",
+        "input_schema": {
+            "type": "object",
+            "properties": {}
+        }
+    },
+    {
+        "name": "browser_close",
+        "description": "Close the browser window when done browsing.",
+        "input_schema": {
+            "type": "object",
+            "properties": {}
+        }
+    },
+    {
         "name": "fetch_url",
         "description": "Fetch and read the content of a webpage given its URL. Use this to read research pages, news articles, or any specific URL Vernie provides.",
         "input_schema": {
@@ -534,6 +729,16 @@ def execute_tool(tool_name, tool_input):
         )
     elif tool_name == "create_multiple_events":
         return create_multiple_events(tool_input["events_list"])
+    elif tool_name == "browser_navigate":
+        return browser_navigate(tool_input["url"])
+    elif tool_name == "browser_fill":
+        return browser_fill(tool_input["label"], tool_input["text"])
+    elif tool_name == "browser_click":
+        return browser_click(tool_input["text"])
+    elif tool_name == "browser_read":
+        return browser_read()
+    elif tool_name == "browser_close":
+        return browser_close()
     elif tool_name == "fetch_url":
         return fetch_url(tool_input["url"])
     elif tool_name == "run_book_scout":
@@ -553,8 +758,6 @@ You have access to Vernie's calendar, Gmail, Google Drive, and local filesystem.
 You can search the web and fetch URLs to find current information, news, and research when Vernie asks about external topics.
 Use your tools whenever a question requires real data.
 Always tell Vernie what you found, not just that you looked.
-Always show Vernie the event details and ask for explicit confirmation before creating a calendar event.
-Always show Vernie the draft email and ask for explicit confirmation before sending. When Vernie confirms, immediately call the send_email tool with no further questions.
 When sending any email, always prefix the subject line with "[Nuncio] " and append the following line at the very bottom of the email body: "Email sent by Nuncio, Vernie's agent".
 You have access to a local inbox folder at /home/vernie/nuncio/nuncio-inbox. Use the list_files tool to see what files are inside it. Only use read_file on specific files returned by list_files, never on folder paths.
 
@@ -577,6 +780,9 @@ while True:
         "content": [{"type": "text", "text": user_input}]
     })
 
+    tool_call_counts = {}
+    MAX_TOOL_RETRIES = 3
+
     while True:
         for attempt in range(3):
             try:
@@ -597,13 +803,41 @@ while True:
 
         if response.stop_reason == "tool_use":
             tool_results = []
+            SILENT_TOOLS = {"run_book_scout"}
             for block in response.content:
                 if block.type == "tool_use":
-                    print(f"[Nuncio is using tool: {block.name}]")
-                    result = execute_tool(block.name, block.input)
-                    SILENT_TOOLS = {"run_book_scout"}
-                    if block.name not in SILENT_TOOLS:
-                        print(f"[Tool result for {block.name}]: {result}")
+                    tool_name = block.name
+                    tool_input = block.input
+
+                    if tool_name in CONFIRMATION_REQUIRED:
+                        print(f"\n[Nuncio wants to use tool: {tool_name}]")
+                        print(json.dumps(tool_input, indent=2))
+                        answer = input("Confirm? (yes/no): ").strip().lower()
+                        if answer != "yes":
+                            result = "Action cancelled by user."
+                            confirmation_status = "denied"
+                            append_action_log(tool_name, tool_input, result, confirmation_status)
+                        else:
+                            confirmation_status = "granted"
+                    else:
+                        confirmation_status = "not_required"
+
+                    if confirmation_status in ("granted", "not_required"):
+                        tool_call_counts[tool_name] = tool_call_counts.get(tool_name, 0) + 1
+                        if tool_call_counts[tool_name] > MAX_TOOL_RETRIES:
+                            result = json.dumps({
+                                "status": "error",
+                                "reason": "retry_limit_reached",
+                                "retryable": False,
+                                "detail": f"{tool_name} has been called {tool_call_counts[tool_name]} times this turn. Stopping. Report this failure to Vernie and do not retry."
+                            })
+                            append_action_log(tool_name, tool_input, result, confirmation_status)
+                        else:
+                            print(f"[Nuncio is using tool: {tool_name}]")
+                            result = execute_tool(tool_name, tool_input)
+                            if tool_name not in SILENT_TOOLS:
+                                print(f"[Tool result for {tool_name}]: {result}")
+                            append_action_log(tool_name, tool_input, result, confirmation_status)
 
                     MAX_TOOL_RESULT_LENGTH = 10000
                     if isinstance(result, str) and len(result) > MAX_TOOL_RESULT_LENGTH:
@@ -620,7 +854,7 @@ while True:
                     
             serialized = []
             for block in response.content:
-                if block.type == "text":
+                if block.type == "text" and block.text:
                     serialized.append({"type": "text", "text": block.text})
                 elif block.type == "tool_use":
                     serialized.append({"type": "tool_use", "id": block.id, "name": block.name, "input": block.input})
