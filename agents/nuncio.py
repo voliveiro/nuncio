@@ -1,5 +1,6 @@
 import anthropic
-import datetime 
+import argparse
+import datetime
 import os
 import io
 import json
@@ -894,6 +895,11 @@ client = anthropic.Anthropic()
 
 # --- Main Loop ---
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--task", type=str, default=None, help="Run headlessly with this task and exit")
+    args = parser.parse_args()
+    headless = args.task is not None
+
     conversation_history = load_history()
     _book_scout_status = book_scout_prompt_fragment()
     _memory_section = load_memory_for_prompt()
@@ -916,12 +922,17 @@ When Vernie asks for a book search, or confirms she wants one, call the run_book
 {_memory_section}
 """
 
-    print("Serviam! Nuncio is ready. Type 'exit' to quit.\n")
+    if not headless:
+        print("Serviam! Nuncio is ready. Type 'exit' to quit.\n")
 
     while True:
-        user_input = input("You: ")
+        if headless:
+            user_input = args.task
+        else:
+            # user_input = input("You: ")  # original
+            user_input = input("You: ")
 
-        if user_input.lower() == "exit":
+        if not headless and user_input.lower() == "exit":
             print("Ite in pace. Nuncio signing off.")
             break
 
@@ -960,17 +971,20 @@ When Vernie asks for a book search, or confirms she wants one, call the run_book
                         tool_input = block.input
 
                         if tool_name in CONFIRMATION_REQUIRED:
-                            print(f"\n[Nuncio wants to use tool: {tool_name}]")
-                            print(json.dumps(tool_input, indent=2))
-                            if tool_name == "remember" and tool_input.get("source") == "external_url":
-                                print("⚠ This memory was derived from external content. Verify before confirming.")
-                            answer = input("Confirm? (yes/no): ").strip().lower()
-                            if answer != "yes":
-                                result = "Action cancelled by user."
-                                confirmation_status = "denied"
-                                append_action_log(tool_name, tool_input, result, confirmation_status)
-                            else:
+                            if headless:
                                 confirmation_status = "granted"
+                            else:
+                                print(f"\n[Nuncio wants to use tool: {tool_name}]")
+                                print(json.dumps(tool_input, indent=2))
+                                if tool_name == "remember" and tool_input.get("source") == "external_url":
+                                    print("⚠ This memory was derived from external content. Verify before confirming.")
+                                answer = input("Confirm? (yes/no): ").strip().lower()
+                                if answer != "yes":
+                                    result = "Action cancelled by user."
+                                    confirmation_status = "denied"
+                                    append_action_log(tool_name, tool_input, result, confirmation_status)
+                                else:
+                                    confirmation_status = "granted"
                         else:
                             confirmation_status = "not_required"
 
@@ -1029,4 +1043,7 @@ When Vernie asks for a book search, or confirms she wants one, call the run_book
                 else:
                     print("[Nuncio completed action with no text response]\n")
                 save_history(conversation_history)
-                break
+                break  # exits inner tool loop
+
+        if headless:
+            break  # exits outer user-turn loop after single headless task
