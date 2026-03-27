@@ -459,7 +459,7 @@ Output ONLY the formatted digest. No preamble, no commentary, nothing else."""
 
 # --- Action Log ---
 ACTION_LOG_FILE = '/home/vernie/nuncio/logs/action_log.jsonl'
-MEMORY_FILE = '/home/vernie/nuncio/logs/memory.json'
+MEMORY_FILE = MEMORY_FILE = os.path.join(os.path.dirname(__file__), '..', 'logs', 'memory.json')
 
 def append_action_log(tool_name, tool_input, result, confirmation_status):
     entry = {
