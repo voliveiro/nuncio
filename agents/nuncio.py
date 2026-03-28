@@ -1,5 +1,5 @@
 import anthropic
-import argparse
+import argpabook_scoutrse
 import datetime
 import os
 import io
@@ -7,7 +7,7 @@ import json
 import requests
 import time
 from bs4 import BeautifulSoup
-from google.oauth2.credentials import Credentials
+from googlebook_scout.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
@@ -60,6 +60,8 @@ def _classify_error(e):
 HISTORY_FILE = os.path.join(os.path.dirname(__file__), '..', 'logs', 'conversation_history.json')
 BOOK_SCOUT_FILE = os.path.join(os.path.dirname(__file__), '..', 'logs', 'book_scout_last_run.txt')
 BOOK_PREFERENCES_FILE = os.path.join(os.path.dirname(__file__), 'book_preferences.md')
+MOVIE_SCOUT_FILE = os.path.join(os.path.dirname(__file__), '..', 'logs', 'movie_scout_last_run.txt')
+MOVIE_PREFERENCES_FILE = os.path.join(os.path.dirname(__file__), 'movie_preferences.md')
 
 def load_history():
     if os.path.exists(HISTORY_FILE):
@@ -108,6 +110,33 @@ def book_scout_prompt_fragment():
             return f"The book scout was last run {days_ago} days ago (on {last_run}). No need to prompt yet."
     except ValueError:
         return "The book scout has never been run."
+
+
+# --- Movie Scout ---
+
+def get_movie_scout_status():
+    if not os.path.exists(MOVIE_SCOUT_FILE):
+        return "never"
+    with open(MOVIE_SCOUT_FILE, 'r') as f:
+        return f.read().strip()
+
+def save_movie_scout_timestamp():
+    with open(MOVIE_SCOUT_FILE, 'w') as f:
+        f.write(datetime.datetime.now().strftime("%Y-%m-%d"))
+
+def movie_scout_prompt_fragment():
+    last_run = get_movie_scout_status()
+    if last_run == "never":
+        return "The movie scout has never been run."
+    try:
+        last_date = datetime.datetime.strptime(last_run, "%Y-%m-%d")
+        days_ago = (datetime.datetime.now() - last_date).days
+        if days_ago >= 7:
+            return f"The movie scout was last run {days_ago} days ago (on {last_run}). This is more than a week — proactively ask Vernie at the start of this conversation if she would like you to run it now."
+        else:
+            return f"The movie scout was last run {days_ago} days ago (on {last_run}). No need to prompt yet."
+    except ValueError:
+        return "The movie scout has never been run."
 
 
 # --- Google Auth ---
@@ -458,6 +487,70 @@ Output ONLY the formatted digest. No preamble, no commentary, nothing else."""
     return "Book scout did not complete — please try again."
 
 
+def run_movie_scout():
+    if not os.path.exists(MOVIE_PREFERENCES_FILE):
+        return "Error: movie_preferences.md not found."
+    with open(MOVIE_PREFERENCES_FILE, 'r') as f:
+        preferences = f.read()
+
+    today = datetime.datetime.now()
+    cutoff = (today - datetime.timedelta(days=60)).strftime("%d %B %Y")
+    month_terms = today.strftime("%B %Y")
+    prev_month_terms = (today.replace(day=1) - datetime.timedelta(days=1)).strftime("%B %Y")
+
+    scout_system = f"""You are a specialist film research agent. Your sole task is to find recently released or reviewed films matching the preferences provided.
+
+Today's date is {today.strftime('%d %B %Y')}.
+Recency cutoff: only include films with reviews, releases, or festival coverage published on or after {cutoff}. Skip anything older — if you cannot confirm the date, skip it.
+
+Search Sight & Sound (BFI), RogerEbert.com, The Guardian Film, IndieWire, Letterboxd top lists, the Criterion Collection, A.V. Club, and Slant Magazine.
+Also check major festival coverage for: Cannes, Venice, Berlin, TIFF, Sundance, and Cinemalaya (Philippine cinema).
+Append '{month_terms}' or '{prev_month_terms}' to search queries to bias toward recent content.
+Search across all relevant categories (world cinema, documentaries, sci-fi, drama) before compiling anything.
+Only compile the digest once you have 5–8 confirmed films within the recency window.
+Include both theatrical releases and streaming premieres.
+
+Format each entry as: **Title** (Director, Year) — Platform/distributor followed by 2–3 sentences on why it matches Vernie's taste and what makes it intellectually stimulating.
+Output ONLY the formatted digest. No preamble, no commentary, nothing else."""
+
+    scout_messages = [{
+        "role": "user",
+        "content": [{"type": "text", "text": f"Find new movie recommendations based on these preferences:\n\n{preferences}"}]
+    }]
+    scout_tools = [{"type": "web_search_20250305", "name": "web_search"}]
+
+    print("[Movie Scout agent starting...]")
+    MAX_ITERATIONS = 30
+    for _ in range(MAX_ITERATIONS):
+        for attempt in range(3):
+            try:
+                response = client.messages.create(
+                    model="claude-haiku-4-5-20251001",
+                    max_tokens=8192,
+                    system=scout_system,
+                    tools=scout_tools,
+                    messages=scout_messages
+                )
+                break
+            except anthropic.APIStatusError as e:
+                if e.status_code == 529 and attempt < 2:
+                    time.sleep(15)
+                else:
+                    raise
+
+        if response.stop_reason == "end_turn":
+            digest = "".join(b.text for b in response.content if b.type == "text")
+            save_movie_scout_timestamp()
+            print("[Movie Scout agent complete.]")
+            return digest
+
+        else:
+            print(f"[Movie Scout] unexpected stop_reason: {response.stop_reason}")
+            break
+
+    return "Movie scout did not complete — please try again."
+
+
 # --- Action Log ---
 ACTION_LOG_FILE = os.path.join(os.path.dirname(__file__), '..', 'logs', 'action_log.jsonl')
 MEMORY_FILE = MEMORY_FILE = os.path.join(os.path.dirname(__file__), '..', 'logs', 'memory.json')
@@ -779,6 +872,14 @@ tools = [
         }
     },
     {
+        "name": "run_movie_scout",
+        "description": "Run the weekly movie scout. Spins up a specialist search agent that finds recently released or reviewed films matching Vernie's preferences, then returns a formatted digest. Call this when Vernie asks for movie recommendations, or when she confirms she wants it run.",
+        "input_schema": {
+            "type": "object",
+            "properties": {}
+        }
+    },
+    {
         "name": "remember",
         "description": "Store a fact in persistent memory. Use this to save things Vernie tells you about contacts, projects, preferences, or standing instructions.",
         "input_schema": {
@@ -874,6 +975,8 @@ def execute_tool(tool_name, tool_input):
         return fetch_url(tool_input["url"])
     elif tool_name == "run_book_scout":
         return run_book_scout()
+    elif tool_name == "run_movie_scout":
+        return run_movie_scout()
     elif tool_name == "remember":
         return remember(
             tool_input["key"],
@@ -902,6 +1005,7 @@ if __name__ == "__main__":
 
     conversation_history = load_history()
     _book_scout_status = book_scout_prompt_fragment()
+    _movie_scout_status = movie_scout_prompt_fragment()
     _memory_section = load_memory_for_prompt()
 
     system_prompt = f"""You are Nuncio, an AI agent with delegated authority to act on behalf of your principal, Vernie.
@@ -918,6 +1022,10 @@ You have access to a local inbox folder at {NUNCIO_FOLDER}. Use the list_files t
 ## Book Scout
 {_book_scout_status}
 When Vernie asks for a book search, or confirms she wants one, call the run_book_scout tool. It will spin up a specialist search agent that does all the research and returns a formatted digest — you do not need to search yourself. Present the digest to Vernie as-is when it arrives.
+
+## Movie Scout
+{_movie_scout_status}
+When Vernie asks for movie recommendations, or confirms she wants them, call the run_movie_scout tool. It will spin up a specialist search agent that finds recently released or reviewed films and returns a formatted digest — you do not need to search yourself. Present the digest to Vernie as-is when it arrives.
 
 {_memory_section}
 """
@@ -964,7 +1072,7 @@ When Vernie asks for a book search, or confirms she wants one, call the run_book
 
             if response.stop_reason == "tool_use":
                 tool_results = []
-                SILENT_TOOLS = {"run_book_scout"}
+                SILENT_TOOLS = {"run_book_scout", "run_movie_scout"}
                 for block in response.content:
                     if block.type == "tool_use":
                         tool_name = block.name
