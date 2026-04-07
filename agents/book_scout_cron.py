@@ -8,6 +8,13 @@ import sys
 import os
 import datetime
 
+# Load API key from file if not already in environment (needed for cron/non-interactive SSH)
+if not os.environ.get('ANTHROPIC_API_KEY'):
+    key_file = os.path.join(os.path.dirname(__file__), '..', 'keys', 'anthropic.key')
+    if os.path.exists(key_file):
+        with open(key_file) as f:
+            os.environ['ANTHROPIC_API_KEY'] = f.read().strip()
+
 sys.path.insert(0, os.path.dirname(__file__))
 from nuncio import run_book_scout, send_email, append_action_log
 
