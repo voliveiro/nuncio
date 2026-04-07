@@ -309,7 +309,7 @@ async def _post_init(application: Application) -> None:
 
 
 if __name__ == "__main__":
-    application = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
+    application = Application.builder().token(BOT_TOKEN).concurrent_updates(True).post_init(_post_init).build()
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(handle_callback))
     try:
