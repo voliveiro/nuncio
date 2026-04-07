@@ -21,3 +21,8 @@ jobs:
             # Set up weekly book scout cron (Fridays 8am) if not already present
             (crontab -l 2>/dev/null | grep -q 'book_scout_cron') || \
               { crontab -l 2>/dev/null; echo "0 8 * * 5 ${{ secrets.HETZNER_REPO_PATH }}/venv/bin/python3 ${{ secrets.HETZNER_REPO_PATH }}/agents/book_scout_cron.py >> ${{ secrets.HETZNER_REPO_PATH }}/logs/book_scout_cron.log 2>&1"; } | crontab -
+            # Install/update Telegram interface systemd service
+            sed "s|REPO_PATH|${{ secrets.HETZNER_REPO_PATH }}|g" ${{ secrets.HETZNER_REPO_PATH }}/deploy/nuncio-telegram.service > /etc/systemd/system/nuncio-telegram.service
+            systemctl daemon-reload
+            systemctl enable nuncio-telegram
+            systemctl restart nuncio-telegram

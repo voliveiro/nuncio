@@ -1,0 +1,16 @@
+[Unit]
+Description=Nuncio Telegram Interface
+After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=REPO_PATH
+ExecStart=REPO_PATH/venv/bin/python3 REPO_PATH/agents/telegram_interface.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
