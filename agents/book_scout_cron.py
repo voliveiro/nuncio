@@ -7,6 +7,7 @@ the interactive confirmation gate.
 import sys
 import os
 import datetime
+import traceback
 
 # Load API key from file if not already in environment (needed for cron/non-interactive SSH)
 if not os.environ.get('ANTHROPIC_API_KEY'):
@@ -27,6 +28,7 @@ def main():
         digest = run_book_scout()
     except Exception as e:
         print(f"[book_scout_cron] run_book_scout failed: {e}")
+        traceback.print_exc()
         append_action_log("book_scout_cron", {"recipient": RECIPIENT}, f"ERROR: {e}", "cron")
         sys.exit(1)
 
