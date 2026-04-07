@@ -17,6 +17,8 @@ CONFIRMATION_REQUIRED = {"send_email", "create_calendar_event", "create_multiple
 # --- Config ---
 CREDS_FILE = os.path.join(os.path.dirname(__file__), '..', 'keys', 'google_credentials.json')
 TOKEN_FILE = os.path.join(os.path.dirname(__file__), '..', 'keys', 'google_token.json')
+TELEGRAM_KEY_FILE = os.path.join(os.path.dirname(__file__), '..', 'keys', 'telegram.key')
+TELEGRAM_USER_ID_FILE = os.path.join(os.path.dirname(__file__), '..', 'keys', 'telegram_user_id.key')
 
 SCOPES = [
     'https://www.googleapis.com/auth/calendar',
@@ -202,6 +204,22 @@ def get_recent_emails(query=None):
             sender = next((h['value'] for h in headers if h['name'] == 'From'), 'Unknown')
             result += f"From: {sender}\nSubject: {subject}\n\n"
         return result
+    except Exception as e:
+        reason, retryable = _classify_error(e)
+        return json.dumps({"status": "error", "reason": reason, "retryable": retryable, "detail": str(e)})
+
+def send_telegram_message(text):
+    try:
+        with open(TELEGRAM_KEY_FILE) as f:
+            token = f.read().strip()
+        with open(TELEGRAM_USER_ID_FILE) as f:
+            user_id = f.read().strip()
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        resp = requests.post(url, json={"chat_id": user_id, "text": text}, timeout=10)
+        resp.raise_for_status()
+        return "Telegram message sent successfully."
+    except FileNotFoundError:
+        return "Error: Telegram not configured (key files missing)."
     except Exception as e:
         reason, retryable = _classify_error(e)
         return json.dumps({"status": "error", "reason": reason, "retryable": retryable, "detail": str(e)})
@@ -838,6 +856,17 @@ tools = [
         }
     },
     {
+        "name": "send_telegram_message",
+        "description": "Send Vernie a Telegram message directly. Use for proactive notifications, reminders, or results from scheduled tasks. Works from any context (terminal or Telegram).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "The message text to send to Vernie"}
+            },
+            "required": ["text"]
+        }
+    },
+    {
         "type": "web_search_20250305",
         "name": "web_search",
     },
@@ -902,6 +931,8 @@ def execute_tool(tool_name, tool_input):
         return list_memories()
     elif tool_name == "delete_memory":
         return delete_memory(tool_input["id"])
+    elif tool_name == "send_telegram_message":
+        return send_telegram_message(tool_input["text"])
     return "Tool not found."
 
 # --- Anthropic client (module-level so run_book_scout can use it when imported) ---
@@ -927,6 +958,7 @@ You can search the web and fetch URLs to find current information, news, and res
 Use your tools whenever a question requires real data.
 Always tell Vernie what you found, not just that you looked.
 When sending any email, always prefix the subject line with "[Nuncio] " and append the following line at the very bottom of the email body: "Email sent by Nuncio, Vernie's agent".
+You can send Vernie a Telegram message directly using the send_telegram_message tool — use this for notifications or when running headlessly.
 You have access to a local inbox folder at {NUNCIO_FOLDER}. Use the list_files tool to see what files are inside it. Only use read_file on specific files returned by list_files, never on folder paths.
 
 ## Book Scout
