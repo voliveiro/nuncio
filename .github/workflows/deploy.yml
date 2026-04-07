@@ -20,6 +20,6 @@ jobs:
             git pull origin main
             # Set up weekly book scout cron (Fridays 8am) if not already present
             (crontab -l 2>/dev/null | grep -q 'book_scout_cron') || \
-              { crontab -l 2>/dev/null; echo "0 8 * * 5 /usr/bin/python3 ${{ secrets.HETZNER_REPO_PATH }}/agents/book_scout_cron.py >> ${{ secrets.HETZNER_REPO_PATH }}/logs/book_scout_cron.log 2>&1"; } | crontab -
+              { crontab -l 2>/dev/null; echo "0 8 * * 5 ${{ secrets.HETZNER_REPO_PATH }}/venv/bin/python3 ${{ secrets.HETZNER_REPO_PATH }}/agents/book_scout_cron.py >> ${{ secrets.HETZNER_REPO_PATH }}/logs/book_scout_cron.log 2>&1"; } | crontab -
             # Run book scout immediately so Vernie can confirm delivery (output visible here for debugging)
-            python3 ${{ secrets.HETZNER_REPO_PATH }}/agents/book_scout_cron.py || echo "[deploy] book_scout_cron.py exited with error — check output above"
+            ${{ secrets.HETZNER_REPO_PATH }}/venv/bin/python3 ${{ secrets.HETZNER_REPO_PATH }}/agents/book_scout_cron.py || echo "[deploy] book_scout_cron.py exited with error — check output above"
