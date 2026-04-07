@@ -60,9 +60,9 @@ def request_confirmation_sync(tool_name: str, tool_input: dict, chat_id: int) ->
     """
     global _pending_confirmation
 
-    text = f"⚙️ Nuncio wants to use: *{tool_name}*\n```\n{json.dumps(tool_input, indent=2)}\n```"
+    text = f"Nuncio wants to use: {tool_name}\n\n{json.dumps(tool_input, indent=2)}"
     if tool_name == "remember" and tool_input.get("source") == "external_url":
-        text += "\n\n⚠ Memory derived from external content — verify before confirming."
+        text += "\n\nMemory derived from external content — verify before confirming."
 
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("✓ Confirm", callback_data="confirm"),
@@ -76,7 +76,7 @@ def request_confirmation_sync(tool_name: str, tool_input: dict, chat_id: int) ->
     # Send the keyboard message from within the async loop
     send_future = asyncio.run_coroutine_threadsafe(
         _bot_application.bot.send_message(
-            chat_id, text, parse_mode="Markdown", reply_markup=keyboard
+            chat_id, text, reply_markup=keyboard
         ),
         _bot_loop,
     )
@@ -128,10 +128,7 @@ async def handle_callback(update: Update, context) -> None:
 
     status = "✓ Confirmed" if pending.confirmed else "✗ Cancelled"
     try:
-        await query.edit_message_text(
-            query.message.text_markdown + f"\n\n{status}",
-            parse_mode="Markdown",
-        )
+        await query.edit_message_text(query.message.text + f"\n\n{status}")
     except Exception:
         pass  # edit_message_text can fail if content is unchanged
 
@@ -300,34 +297,19 @@ async def handle_message(update: Update, context) -> None:
 
 # --- Entry point ---
 
-async def main() -> None:
+async def _post_init(application: Application) -> None:
     global _turn_lock, _bot_loop, _bot_application
-
     _turn_lock = asyncio.Lock()
     _bot_loop = asyncio.get_running_loop()
-
-    application = Application.builder().token(BOT_TOKEN).build()
     _bot_application = application
-
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.add_handler(CallbackQueryHandler(handle_callback))
-
     print(f"Nuncio Telegram interface starting. Listening for user ID {ALLOWED_USER_ID}...")
-
-    async with application:
-        await application.start()
-        await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-        try:
-            await asyncio.Event().wait()  # Run until interrupted
-        except (asyncio.CancelledError, KeyboardInterrupt):
-            pass
-        finally:
-            await application.updater.stop()
-            await application.stop()
 
 
 if __name__ == "__main__":
+    application = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(CallbackQueryHandler(handle_callback))
     try:
-        asyncio.run(main())
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
     except KeyboardInterrupt:
         print("\nNuncio Telegram interface stopped.")
