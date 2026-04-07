@@ -107,7 +107,10 @@ async def handle_callback(update: Update, context) -> None:
     global _pending_confirmation
 
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except Exception:
+        return  # Query too old (stale button from a previous session)
 
     if query.from_user.id != ALLOWED_USER_ID:
         return
