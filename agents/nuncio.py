@@ -452,6 +452,12 @@ Output ONLY the formatted digest. No preamble, no commentary, nothing else."""
             print("[Book Scout agent complete.]")
             return digest
 
+        elif response.stop_reason == "tool_use":
+            # Web search is server-side: append the full response (including search
+            # queries and results) as the assistant turn, then loop to let the model
+            # continue generating its answer.
+            scout_messages.append({"role": "assistant", "content": response.content})
+
         else:
             print(f"[Book Scout] unexpected stop_reason: {response.stop_reason}")
             break
