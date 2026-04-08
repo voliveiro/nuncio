@@ -18,6 +18,13 @@ import sys
 import threading
 import time
 
+# Load API key from file if not already in environment (needed for systemd/non-interactive envs)
+if not os.environ.get('ANTHROPIC_API_KEY'):
+    key_file = os.path.join(os.path.dirname(__file__), '..', 'keys', 'anthropic.key')
+    if os.path.exists(key_file):
+        with open(key_file) as f:
+            os.environ['ANTHROPIC_API_KEY'] = f.read().strip()
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CallbackQueryHandler, MessageHandler, filters
 
