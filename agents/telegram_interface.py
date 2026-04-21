@@ -283,6 +283,32 @@ When Vernie asks for a book search, or confirms she wants one, call the run_book
 
 # --- Telegram message handler ---
 
+async def _download_attachment(update: Update, context) -> str | None:
+    """
+    Downloads the file attached to a message (document or highest-res photo)
+    into NUNCIO_FOLDER. Returns the saved file path, or None on failure.
+    """
+    msg = update.message
+    tg_file = None
+    filename = None
+
+    if msg.document:
+        tg_file = await context.bot.get_file(msg.document.file_id)
+        filename = msg.document.file_name or f"attachment_{msg.document.file_id}"
+    elif msg.photo:
+        # Telegram sends multiple resolutions; take the largest
+        photo = max(msg.photo, key=lambda p: p.file_size or 0)
+        tg_file = await context.bot.get_file(photo.file_id)
+        filename = f"photo_{photo.file_id}.jpg"
+
+    if tg_file is None:
+        return None
+
+    dest = os.path.join(n.NUNCIO_FOLDER, filename)
+    await tg_file.download_to_drive(dest)
+    return dest
+
+
 async def handle_message(update: Update, context) -> None:
     """Handle incoming text messages from Vernie."""
     if update.effective_user.id != ALLOWED_USER_ID:
@@ -308,6 +334,41 @@ async def handle_message(update: Update, context) -> None:
         await context.bot.send_message(chat_id, reply[i:i + 4096])
 
 
+async def handle_file(update: Update, context) -> None:
+    """Handle incoming document or photo messages from Vernie."""
+    if update.effective_user.id != ALLOWED_USER_ID:
+        return
+
+    chat_id = update.effective_chat.id
+
+    file_path = await _download_attachment(update, context)
+    if file_path is None:
+        await context.bot.send_message(chat_id, "⚠️ Could not download the attached file.")
+        return
+
+    caption = update.message.caption or ""
+    user_text = f"I've attached a file: {file_path}"
+    if caption:
+        user_text = f"{caption}\n\n[Attached file saved to: {file_path}]"
+    else:
+        user_text = f"[Attached file saved to: {file_path}] — what would you like me to do with it?"
+
+    async with _turn_lock:
+        await context.bot.send_chat_action(chat_id, "typing")
+        loop = asyncio.get_running_loop()
+        try:
+            reply = await loop.run_in_executor(None, run_nuncio_turn, user_text, chat_id)
+        except Exception as e:
+            await context.bot.send_message(chat_id, f"⚠️ Nuncio encountered an error: {e}")
+            return
+
+    if not reply:
+        reply = "[Nuncio completed the action with no text response]"
+
+    for i in range(0, len(reply), 4096):
+        await context.bot.send_message(chat_id, reply[i:i + 4096])
+
+
 # --- Entry point ---
 
 async def _post_init(application: Application) -> None:
@@ -321,6 +382,7 @@ async def _post_init(application: Application) -> None:
 if __name__ == "__main__":
     application = Application.builder().token(BOT_TOKEN).concurrent_updates(True).post_init(_post_init).build()
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, handle_file))
     application.add_handler(CallbackQueryHandler(handle_callback))
     try:
         application.run_polling(allowed_updates=Update.ALL_TYPES)
