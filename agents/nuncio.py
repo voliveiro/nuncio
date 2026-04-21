@@ -12,7 +12,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
-CONFIRMATION_REQUIRED = {"send_email", "create_calendar_event", "create_multiple_events", "upload_to_drive", "remember", "delete_memory"}
+CONFIRMATION_REQUIRED = {"send_email", "send_email_with_attachments", "create_calendar_event", "create_multiple_events", "upload_to_drive", "remember", "delete_memory"}
 
 # --- Config ---
 CREDS_FILE = os.path.join(os.path.dirname(__file__), '..', 'keys', 'google_credentials.json')
@@ -236,6 +236,46 @@ def send_email(to, subject, body):
     service.users().messages().send(userId='me', body={'raw': raw}).execute()
     return f"Email sent to {to} with subject '{subject}'"
 
+def send_email_with_attachments(to, subject, body, attachment_paths):
+    import base64
+    import mimetypes
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+    from email.mime.base import MIMEBase
+    from email import encoders
+    try:
+        creds = get_credentials()
+        service = build('gmail', 'v1', credentials=creds)
+        message = MIMEMultipart()
+        message['to'] = to
+        message['subject'] = subject
+        message.attach(MIMEText(body))
+        missing = []
+        for filepath in attachment_paths:
+            if not os.path.exists(filepath):
+                missing.append(filepath)
+                continue
+            mimetype, _ = mimetypes.guess_type(filepath)
+            if mimetype is None:
+                _, ext = os.path.splitext(filepath)
+                mimetype = MIMETYPE_MAP.get(ext.lower(), 'application/octet-stream')
+            maintype, subtype = mimetype.split('/', 1)
+            with open(filepath, 'rb') as fh:
+                part = MIMEBase(maintype, subtype)
+                part.set_payload(fh.read())
+            encoders.encode_base64(part)
+            part.add_header('Content-Disposition', 'attachment', filename=os.path.basename(filepath))
+            message.attach(part)
+        if missing:
+            return json.dumps({"status": "error", "reason": "file_not_found", "retryable": False, "detail": f"Files not found: {missing}"})
+        raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
+        service.users().messages().send(userId='me', body={'raw': raw}).execute()
+        names = [os.path.basename(p) for p in attachment_paths]
+        return f"Email sent to {to} with subject '{subject}' and attachments: {', '.join(names)}"
+    except Exception as e:
+        reason, retryable = _classify_error(e)
+        return json.dumps({"status": "error", "reason": reason, "retryable": retryable, "detail": str(e)})
+
 # --- Drive Tools ---
 def list_drive_files(query=None):
     try:
@@ -273,6 +313,41 @@ def upload_to_drive(filename, content):
         fields='id, name'
     ).execute()
     return f"File '{file['name']}' uploaded to Google Drive with ID: {file['id']}"
+
+MIMETYPE_MAP = {
+    '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    '.pdf':  'application/pdf',
+    '.txt':  'text/plain',
+    '.csv':  'text/csv',
+    '.png':  'image/png',
+    '.jpg':  'image/jpeg',
+    '.jpeg': 'image/jpeg',
+}
+
+def upload_file_to_drive(filepath):
+    import mimetypes
+    try:
+        if not os.path.exists(filepath):
+            return json.dumps({"status": "error", "reason": "file_not_found", "retryable": False, "detail": f"File not found: {filepath}"})
+        _, ext = os.path.splitext(filepath)
+        mimetype = MIMETYPE_MAP.get(ext.lower()) or mimetypes.guess_type(filepath)[0] or 'application/octet-stream'
+        filename = os.path.basename(filepath)
+        creds = get_credentials()
+        service = build('drive', 'v3', credentials=creds)
+        file_metadata = {'name': filename}
+        with open(filepath, 'rb') as fh:
+            media = MediaIoBaseUpload(fh, mimetype=mimetype, resumable=True)
+            file = service.files().create(
+                body=file_metadata,
+                media_body=media,
+                fields='id, name'
+            ).execute()
+        return f"File '{file['name']}' uploaded to Google Drive with ID: {file['id']}"
+    except Exception as e:
+        reason, retryable = _classify_error(e)
+        return json.dumps({"status": "error", "reason": reason, "retryable": retryable, "detail": str(e)})
 
 
 # --- Local File Tools ---
@@ -333,6 +408,50 @@ def read_docx(filepath):
     except Exception as e:
         reason, retryable = _classify_error(e)
         return json.dumps({"status": "error", "reason": reason, "retryable": retryable, "detail": str(e)})
+
+# --- Presentation Tool ---
+
+def create_presentation(title, slides, output_filename=None):
+    from pptx import Presentation
+    from pptx.util import Pt
+    try:
+        prs = Presentation()
+
+        # Title slide
+        title_slide = prs.slides.add_slide(prs.slide_layouts[0])
+        title_slide.shapes.title.text = title
+        if len(title_slide.placeholders) > 1:
+            title_slide.placeholders[1].text = ""
+
+        # Content slides
+        for s in slides:
+            slide = prs.slides.add_slide(prs.slide_layouts[1])
+            slide.shapes.title.text = s.get("title", "")
+            tf = slide.placeholders[1].text_frame
+            tf.clear()
+            bullets = s.get("bullets", [])
+            for i, bullet in enumerate(bullets):
+                if i == 0:
+                    tf.paragraphs[0].text = bullet
+                else:
+                    p = tf.add_paragraph()
+                    p.text = bullet
+                    p.level = s.get("level", 0) if isinstance(bullet, str) else bullet.get("level", 0)
+            if s.get("notes"):
+                slide.notes_slide.notes_text_frame.text = s["notes"]
+
+        if output_filename is None:
+            slug = title.lower().replace(" ", "_")
+            slug = "".join(c for c in slug if c.isalnum() or c == "_")
+            output_filename = slug + ".pptx"
+
+        output_path = os.path.join(NUNCIO_FOLDER, output_filename)
+        prs.save(output_path)
+        return f"Presentation saved to {output_path} ({len(slides)} slides). Use upload_file_to_drive with filepath='{output_path}' to share it on Google Drive."
+    except Exception as e:
+        reason, retryable = _classify_error(e)
+        return json.dumps({"status": "error", "reason": reason, "retryable": retryable, "detail": str(e)})
+
 
 # --- Browser session (persistent across tool calls) ---
 _playwright_instance = None
@@ -506,6 +625,48 @@ def append_action_log(tool_name, tool_input, result, confirmation_status):
         f.write(json.dumps(entry) + '\n')
 
 
+def _is_error_result(result):
+    """Return True if a tool result is a structured error response."""
+    if not isinstance(result, str):
+        return False
+    try:
+        data = json.loads(result)
+        return isinstance(data, dict) and data.get("status") == "error"
+    except (json.JSONDecodeError, ValueError):
+        return False
+
+_owner_email_cache = None
+
+def get_owner_email():
+    global _owner_email_cache
+    if _owner_email_cache is None:
+        try:
+            creds = get_credentials()
+            service = build('gmail', 'v1', credentials=creds)
+            _owner_email_cache = service.users().getProfile(userId='me').execute()['emailAddress']
+        except Exception:
+            pass
+    return _owner_email_cache
+
+def notify_failure(context: str, detail: str):
+    """Notify Vernie via Telegram and email when something goes wrong."""
+    msg = f"⚠ Nuncio failure\n\nContext: {context}\n\nDetail: {detail}"
+    try:
+        send_telegram_message(msg)
+    except Exception:
+        pass
+    try:
+        owner = get_owner_email()
+        if owner:
+            send_email(
+                owner,
+                "[Nuncio] Failure Alert",
+                msg + "\n\nEmail sent by Nuncio, Vernie's agent"
+            )
+    except Exception:
+        pass
+
+
 # --- Memory Store ---
 
 ALLOWED_MEMORY_CATEGORIES = {"contact", "project", "preference", "standing_instruction"}
@@ -616,7 +777,7 @@ tools = [
     },
     {
         "name": "send_email",
-        "description": "Send an email via Gmail on behalf of Vernie.",
+        "description": "Send a plain-text email via Gmail on behalf of Vernie. For emails with file attachments, use send_email_with_attachments instead.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -625,6 +786,24 @@ tools = [
                 "body": {"type": "string", "description": "Email body text"}
             },
             "required": ["to", "subject", "body"]
+        }
+    },
+    {
+        "name": "send_email_with_attachments",
+        "description": "Send an email via Gmail with one or more file attachments. Pass the full local file paths — the files are attached as binary without reading their contents into the conversation. Use this whenever Vernie asks to attach a file to an email.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "to": {"type": "string", "description": "Recipient email address"},
+                "subject": {"type": "string", "description": "Email subject"},
+                "body": {"type": "string", "description": "Email body text"},
+                "attachment_paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of full local file paths to attach, e.g. [\"/home/vernie/nuncio/nuncio-inbox/report.pdf\"]"
+                }
+            },
+            "required": ["to", "subject", "body", "attachment_paths"]
         }
     },
     {
@@ -640,7 +819,7 @@ tools = [
     },
     {
         "name": "upload_to_drive",
-        "description": "Upload a text file to Google Drive.",
+        "description": "Upload a text file to Google Drive. Use this only for plain text content. For binary files (pptx, docx, pdf, images) that already exist on disk, use upload_file_to_drive instead.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -648,6 +827,17 @@ tools = [
                 "content": {"type": "string", "description": "Text content to write to the file"}
             },
             "required": ["filename", "content"]
+        }
+    },
+    {
+        "name": "upload_file_to_drive",
+        "description": "Upload a binary or non-text file that already exists on the local filesystem to Google Drive, preserving its format. Use this for .pptx, .docx, .pdf, images, and any other non-text files. Pass the full file path returned by create_presentation or list_files.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "filepath": {"type": "string", "description": "Full local path to the file to upload, e.g. /home/vernie/nuncio/nuncio-inbox/my_presentation.pptx"}
+            },
+            "required": ["filepath"]
         }
     },
     {
@@ -731,6 +921,35 @@ tools = [
             }
         },
         "required": ["events_list"]
+        }
+    },
+    {
+        "name": "create_presentation",
+        "description": "Create a PowerPoint (.pptx) presentation and save it to the local inbox. Each slide has a title, bullet points, and optional speaker notes. After creation, offer to upload it to Google Drive.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Presentation title, used on the title slide and as the filename"},
+                "slides": {
+                    "type": "array",
+                    "description": "Ordered list of slides",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string", "description": "Slide heading"},
+                            "bullets": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Body bullet points"
+                            },
+                            "notes": {"type": "string", "description": "Optional speaker notes"}
+                        },
+                        "required": ["title"]
+                    }
+                },
+                "output_filename": {"type": "string", "description": "Optional override for the .pptx filename"}
+            },
+            "required": ["title", "slides"]
         }
     },
     {
@@ -880,10 +1099,20 @@ def execute_tool(tool_name, tool_input):
         return get_recent_emails(tool_input.get("query"))
     elif tool_name == "send_email":
         return send_email(tool_input["to"], tool_input["subject"], tool_input["body"])
+    elif tool_name == "send_email_with_attachments":
+        return send_email_with_attachments(tool_input["to"], tool_input["subject"], tool_input["body"], tool_input["attachment_paths"])
     elif tool_name == "list_drive_files":
         return list_drive_files(tool_input.get("query"))
     elif tool_name == "upload_to_drive":
         return upload_to_drive(tool_input["filename"], tool_input["content"])
+    elif tool_name == "upload_file_to_drive":
+        return upload_file_to_drive(tool_input["filepath"])
+    elif tool_name == "create_presentation":
+        return create_presentation(
+            tool_input["title"],
+            tool_input["slides"],
+            tool_input.get("output_filename")
+        )
     elif tool_name == "list_files":
         return list_files()
     elif tool_name == "write_file":
@@ -971,125 +1200,134 @@ When Vernie asks for a book search, or confirms she wants one, call the run_book
     if not headless:
         print("Serviam! Nuncio is ready. Type 'exit' to quit.\n")
 
-    while True:
-        if headless:
-            user_input = args.task
-        else:
-            # user_input = input("You: ")  # original
-            user_input = input("You: ")
-
-        if not headless and user_input.lower() == "exit":
-            print("Ite in pace. Nuncio signing off.")
-            break
-
-        conversation_history.append({
-            "role": "user",
-            "content": [{"type": "text", "text": user_input}]
-        })
-
-        tool_call_counts = {}
-        MAX_TOOL_RETRIES = 3
-
+    try:
         while True:
-            for attempt in range(3):
-                try:
-                    response = client.messages.create(
-                        model="claude-sonnet-4-6",
-                        max_tokens=4096,
-                        system=system_prompt,
-                        tools=tools,
-                        messages=conversation_history
-                    )
-                    break
-                except anthropic.APIStatusError as e:
-                    if e.status_code == 529 and attempt < 2:
-                        print(f"[Nuncio] API overloaded, retrying in 15 seconds... (attempt {attempt + 1}/3)")
-                        time.sleep(15)
-                    else:
-                        raise
+            if headless:
+                user_input = args.task
+            else:
+                # user_input = input("You: ")  # original
+                user_input = input("You: ")
 
-            if response.stop_reason == "tool_use":
-                tool_results = []
-                SILENT_TOOLS = {"run_book_scout"}
-                for block in response.content:
-                    if block.type == "tool_use":
-                        tool_name = block.name
-                        tool_input = block.input
+            if not headless and user_input.lower() == "exit":
+                print("Ite in pace. Nuncio signing off.")
+                break
 
-                        if tool_name in CONFIRMATION_REQUIRED:
-                            if headless:
-                                confirmation_status = "granted"
+            conversation_history.append({
+                "role": "user",
+                "content": [{"type": "text", "text": user_input}]
+            })
+
+            tool_call_counts = {}
+            MAX_TOOL_RETRIES = 3
+
+            while True:
+                for attempt in range(3):
+                    try:
+                        response = client.messages.create(
+                            model="claude-sonnet-4-6",
+                            max_tokens=4096,
+                            system=system_prompt,
+                            tools=tools,
+                            messages=conversation_history
+                        )
+                        break
+                    except anthropic.APIStatusError as e:
+                        if e.status_code == 529 and attempt < 2:
+                            print(f"[Nuncio] API overloaded, retrying in 15 seconds... (attempt {attempt + 1}/3)")
+                            time.sleep(15)
+                        else:
+                            notify_failure("Anthropic API", f"status {e.status_code}: {e}")
+                            raise
+
+                if response.stop_reason == "tool_use":
+                    tool_results = []
+                    SILENT_TOOLS = {"run_book_scout"}
+                    for block in response.content:
+                        if block.type == "tool_use":
+                            tool_name = block.name
+                            tool_input = block.input
+
+                            if tool_name in CONFIRMATION_REQUIRED:
+                                if headless:
+                                    confirmation_status = "granted"
+                                else:
+                                    print(f"\n[Nuncio wants to use tool: {tool_name}]")
+                                    print(json.dumps(tool_input, indent=2))
+                                    if tool_name == "remember" and tool_input.get("source") == "external_url":
+                                        print("⚠ This memory was derived from external content. Verify before confirming.")
+                                    answer = input("Confirm? (yes/no): ").strip().lower()
+                                    if answer != "yes":
+                                        result = "Action cancelled by user."
+                                        confirmation_status = "denied"
+                                        append_action_log(tool_name, tool_input, result, confirmation_status)
+                                    else:
+                                        confirmation_status = "granted"
                             else:
-                                print(f"\n[Nuncio wants to use tool: {tool_name}]")
-                                print(json.dumps(tool_input, indent=2))
-                                if tool_name == "remember" and tool_input.get("source") == "external_url":
-                                    print("⚠ This memory was derived from external content. Verify before confirming.")
-                                answer = input("Confirm? (yes/no): ").strip().lower()
-                                if answer != "yes":
-                                    result = "Action cancelled by user."
-                                    confirmation_status = "denied"
+                                confirmation_status = "not_required"
+
+                            if confirmation_status in ("granted", "not_required"):
+                                tool_call_counts[tool_name] = tool_call_counts.get(tool_name, 0) + 1
+                                if tool_call_counts[tool_name] > MAX_TOOL_RETRIES:
+                                    result = json.dumps({
+                                        "status": "error",
+                                        "reason": "retry_limit_reached",
+                                        "retryable": False,
+                                        "detail": f"{tool_name} has been called {tool_call_counts[tool_name]} times this turn. Stopping. Report this failure to Vernie and do not retry."
+                                    })
                                     append_action_log(tool_name, tool_input, result, confirmation_status)
                                 else:
-                                    confirmation_status = "granted"
-                        else:
-                            confirmation_status = "not_required"
+                                    print(f"[Nuncio is using tool: {tool_name}]")
+                                    result = execute_tool(tool_name, tool_input)
+                                    if tool_name not in SILENT_TOOLS:
+                                        print(f"[Tool result for {tool_name}]: {result}")
+                                    append_action_log(tool_name, tool_input, result, confirmation_status)
+                                    if _is_error_result(result):
+                                        notify_failure(f"tool: {tool_name}", result)
 
-                        if confirmation_status in ("granted", "not_required"):
-                            tool_call_counts[tool_name] = tool_call_counts.get(tool_name, 0) + 1
-                            if tool_call_counts[tool_name] > MAX_TOOL_RETRIES:
-                                result = json.dumps({
-                                    "status": "error",
-                                    "reason": "retry_limit_reached",
-                                    "retryable": False,
-                                    "detail": f"{tool_name} has been called {tool_call_counts[tool_name]} times this turn. Stopping. Report this failure to Vernie and do not retry."
-                                })
-                                append_action_log(tool_name, tool_input, result, confirmation_status)
+                            MAX_TOOL_RESULT_LENGTH = 10000
+                            if isinstance(result, str) and len(result) > MAX_TOOL_RESULT_LENGTH:
+                                history_result = result[:MAX_TOOL_RESULT_LENGTH] + "\n[...truncated for history...]"
                             else:
-                                print(f"[Nuncio is using tool: {tool_name}]")
-                                result = execute_tool(tool_name, tool_input)
-                                if tool_name not in SILENT_TOOLS:
-                                    print(f"[Tool result for {tool_name}]: {result}")
-                                append_action_log(tool_name, tool_input, result, confirmation_status)
+                                history_result = result
 
-                        MAX_TOOL_RESULT_LENGTH = 10000
-                        if isinstance(result, str) and len(result) > MAX_TOOL_RESULT_LENGTH:
-                            history_result = result[:MAX_TOOL_RESULT_LENGTH] + "\n[...truncated for history...]"
-                        else:
-                            history_result = result
+                            tool_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": block.id,
+                                "content": history_result
+                            })
 
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": history_result
-                        })
-
-                serialized = []
-                for block in response.content:
-                    if block.type == "text" and block.text:
-                        serialized.append({"type": "text", "text": block.text})
-                    elif block.type == "tool_use":
-                        serialized.append({"type": "tool_use", "id": block.id, "name": block.name, "input": block.input})
-                conversation_history.append({
-                    "role": "assistant",
-                    "content": serialized
-                })
-                conversation_history.append({
-                    "role": "user",
-                    "content": tool_results
-                })
-
-            else:
-                reply = next((b.text for b in response.content if b.type == "text"), "")
-                if reply:
+                    serialized = []
+                    for block in response.content:
+                        if block.type == "text" and block.text:
+                            serialized.append({"type": "text", "text": block.text})
+                        elif block.type == "tool_use":
+                            serialized.append({"type": "tool_use", "id": block.id, "name": block.name, "input": block.input})
                     conversation_history.append({
                         "role": "assistant",
-                        "content": [{"type": "text", "text": reply}]
+                        "content": serialized
                     })
-                    print(f"\nNuncio: {reply}\n")
-                else:
-                    print("[Nuncio completed action with no text response]\n")
-                save_history(conversation_history)
-                break  # exits inner tool loop
+                    conversation_history.append({
+                        "role": "user",
+                        "content": tool_results
+                    })
 
+                else:
+                    reply = next((b.text for b in response.content if b.type == "text"), "")
+                    if reply:
+                        conversation_history.append({
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": reply}]
+                        })
+                        print(f"\nNuncio: {reply}\n")
+                    else:
+                        print("[Nuncio completed action with no text response]\n")
+                    save_history(conversation_history)
+                    break  # exits inner tool loop
+
+            if headless:
+                break  # exits outer user-turn loop after single headless task
+
+    except Exception as e:
         if headless:
-            break  # exits outer user-turn loop after single headless task
+            notify_failure(f"headless task: {args.task}", str(e))
+        raise

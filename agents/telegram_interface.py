@@ -200,6 +200,7 @@ When Vernie asks for a book search, or confirms she wants one, call the run_book
                 if attempt < 2:
                     time.sleep(15)
                 else:
+                    n.notify_failure("Anthropic API (Telegram)", str(e))
                     raise
 
         if response.stop_reason == "tool_use":
@@ -238,6 +239,8 @@ When Vernie asks for a book search, or confirms she wants one, call the run_book
                             print(f"[Telegram][Tool: {tool_name}]")
                         result = n.execute_tool(tool_name, tool_input)
                         n.append_action_log(tool_name, tool_input, result, confirmation_status)
+                        if n._is_error_result(result):
+                            n.notify_failure(f"tool: {tool_name}", result)
 
                 MAX_LEN = 10000
                 history_result = (
