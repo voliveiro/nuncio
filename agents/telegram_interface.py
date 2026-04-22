@@ -46,6 +46,11 @@ _turn_lock: asyncio.Lock = None          # Serialise one Nuncio turn at a time
 _bot_loop: asyncio.AbstractEventLoop = None
 _bot_application: Application = None
 
+# --- Message aggregation (join rapid successive messages from split pastes) ---
+_BUFFER_DELAY = 1.5  # seconds to wait for more messages before processing
+_pending_messages: list[str] = []
+_buffer_task: asyncio.Task | None = None
+
 # --- Confirmation bridge (sync executor thread ↔ async event loop) ---
 
 _pending_lock = threading.Lock()
@@ -167,6 +172,7 @@ Always tell Vernie what you found, not just that you looked.
 When sending any email, always prefix the subject line with "[Nuncio] " and append the following line at the very bottom of the email body: "Email sent by Nuncio, Vernie's agent".
 You have access to a local inbox folder at {n.NUNCIO_FOLDER}. Use the list_files tool to see what files are inside it. Only use read_file on specific files returned by list_files, never on folder paths.
 This message came via Telegram. You can send Vernie proactive Telegram messages using the send_telegram_message tool.
+When Vernie pastes a block of text — for use as an email body, a document, or any other purpose — treat it as complete and ready to use. Do not ask whether there is more to follow; proceed directly with the task.
 
 ## Book Scout
 {book_scout_status}
@@ -309,13 +315,22 @@ async def _download_attachment(update: Update, context) -> str | None:
     return dest
 
 
-async def handle_message(update: Update, context) -> None:
-    """Handle incoming text messages from Vernie."""
-    if update.effective_user.id != ALLOWED_USER_ID:
-        return  # Silently ignore anyone else
+async def _flush_messages(chat_id: int, context) -> None:
+    """
+    Called after _BUFFER_DELAY seconds of silence. Joins all buffered message
+    parts into one string and sends a single turn to Nuncio.
+    Handles the case where a pasted block is split into multiple Telegram messages.
+    """
+    global _pending_messages, _buffer_task
 
-    chat_id = update.effective_chat.id
-    user_text = update.message.text
+    await asyncio.sleep(_BUFFER_DELAY)
+
+    # Drain the buffer
+    parts = _pending_messages[:]
+    _pending_messages.clear()
+    _buffer_task = None
+
+    user_text = "\n\n".join(parts)
 
     async with _turn_lock:
         await context.bot.send_chat_action(chat_id, "typing")
@@ -329,9 +344,26 @@ async def handle_message(update: Update, context) -> None:
     if not reply:
         reply = "[Nuncio completed the action with no text response]"
 
-    # Telegram caps messages at 4096 characters
     for i in range(0, len(reply), 4096):
         await context.bot.send_message(chat_id, reply[i:i + 4096])
+
+
+async def handle_message(update: Update, context) -> None:
+    """Handle incoming text messages from Vernie."""
+    global _pending_messages, _buffer_task
+
+    if update.effective_user.id != ALLOWED_USER_ID:
+        return  # Silently ignore anyone else
+
+    chat_id = update.effective_chat.id
+    _pending_messages.append(update.message.text)
+
+    # Cancel any existing flush timer and restart it so we keep waiting for more parts
+    if _buffer_task is not None:
+        _buffer_task.cancel()
+    _buffer_task = asyncio.get_running_loop().create_task(
+        _flush_messages(chat_id, context)
+    )
 
 
 async def handle_file(update: Update, context) -> None:
