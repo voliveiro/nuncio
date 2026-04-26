@@ -172,7 +172,10 @@ Always tell Vernie what you found, not just that you looked.
 When sending any email, always prefix the subject line with "[Nuncio] " and append the following line at the very bottom of the email body: "Email sent by Nuncio, Vernie's agent".
 You have access to a local inbox folder at {n.NUNCIO_FOLDER}. Use the list_files tool to see what files are inside it. Only use read_file on specific files returned by list_files, never on folder paths.
 This message came via Telegram. You can send Vernie proactive Telegram messages using the send_telegram_message tool.
-When Vernie pastes a block of text — for use as an email body, a document, or any other purpose — treat it as complete and ready to use. Do not ask whether there is more to follow; proceed directly with the task.
+When Vernie sends a block of text that is clearly the beginning of a longer piece — for example, a numbered list with only the first item, a sentence that ends mid-thought, or an email body that seems to start but not finish — respond with ONLY the single word "Continue." Do not ask "is this complete?", do not attempt to send anything, do not add commentary. Keep responding "Continue." for each subsequent chunk until Vernie signals she is done (e.g. "done", "send it", "that's all", "go ahead"). When she signals done, look back through the conversation history to assemble every chunk she sent into the complete text, then proceed with the task using that reconstructed text.
+
+## Browser
+Nuncio can attach to Vernie's existing Chrome/Chromium browser if it was started with --remote-debugging-port=9222, and will reuse an already-open tab for the same domain. This does NOT work with Firefox — Playwright can only attach to Chrome/Chromium via CDP. If browser_navigate returns a note saying it fell back to a new headless window, explain the specific reason (e.g. "Firefox doesn't support this — you'd need to use Chrome with remote debugging enabled") and give the exact command: google-chrome --remote-debugging-port=9222. Do not claim the browser tool always opens a separate session without checking — the tool result will say if a fallback occurred and why.
 
 ## Book Scout
 {book_scout_status}
@@ -187,7 +190,7 @@ When Vernie asks for a book search, or confirms she wants one, call the run_book
     })
 
     tool_call_counts: dict[str, int] = {}
-    MAX_TOOL_RETRIES = 3
+    MAX_TOOL_RETRIES = 8
     SILENT_TOOLS = {"run_book_scout"}
 
     while True:

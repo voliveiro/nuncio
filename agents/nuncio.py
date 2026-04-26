@@ -5,6 +5,7 @@ import os
 import io
 import json
 import requests
+import subprocess
 import time
 from bs4 import BeautifulSoup
 from google.oauth2.credentials import Credentials
@@ -457,49 +458,544 @@ def create_presentation(title, slides, output_filename=None):
 _playwright_instance = None
 _browser_instance = None
 _page_instance = None
+_browser_owned = False  # True if Nuncio launched the browser; False if attached via CDP
+
+# Chrome default: 9222  |  Firefox default: 9223
+CDP_PORTS = [9222, 9223]
+
+_cdp_attach_failed_reason = None  # set when CDP attach is attempted but fails
+
+# --- Firefox CDP session ---
+_firefox_cdp_session = None
+
+
+class FirefoxCDPSession:
+    """CDP-over-WebSocket bridge to an existing Firefox with --remote-debugging-port."""
+
+    def __init__(self, port, ws_url):
+        import websocket as _ws
+        self.port = port
+        self._ws = _ws.WebSocket()
+        self._ws.settimeout(15)
+        self._ws.connect(ws_url)
+        self._msg_id = 0
+
+    def _send(self, method, params=None):
+        self._msg_id += 1
+        mid = self._msg_id
+        self._ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            try:
+                self._ws.settimeout(max(0.1, deadline - time.time()))
+                raw = self._ws.recv()
+            except Exception:
+                break
+            if not raw:
+                continue
+            data = json.loads(raw)
+            if data.get("id") == mid:
+                if "error" in data:
+                    raise RuntimeError(f"CDP: {data['error'].get('message', str(data['error']))}")
+                return data.get("result", {})
+        raise TimeoutError(f"No CDP response for {method}")
+
+    def evaluate(self, expression):
+        result = self._send("Runtime.evaluate", {
+            "expression": expression,
+            "returnByValue": True,
+            "awaitPromise": False,
+        })
+        val = result.get("result", {})
+        if val.get("type") == "undefined" or val.get("subtype") == "null":
+            return None
+        return val.get("value")
+
+    def navigate(self, url):
+        self._send("Page.navigate", {"url": url})
+        self._wait_for_load()
+
+    def _wait_for_load(self, timeout=15):
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                if self.evaluate("document.readyState") == "complete":
+                    return
+            except Exception:
+                pass
+            time.sleep(0.4)
+
+    def title(self):
+        return self.evaluate("document.title") or ""
+
+    def current_url(self):
+        return self.evaluate("window.location.href") or ""
+
+    def reconnect(self, ws_url):
+        try:
+            self._ws.close()
+        except Exception:
+            pass
+        import websocket as _ws
+        self._ws = _ws.WebSocket()
+        self._ws.settimeout(15)
+        self._ws.connect(ws_url)
+
+    def close(self):
+        try:
+            self._ws.close()
+        except Exception:
+            pass
+
+
+def _detect_browser_on_port(port):
+    """Returns 'firefox', 'chrome', or None based on /json/version."""
+    try:
+        resp = requests.get(f"http://localhost:{port}/json/version", timeout=1)
+        browser = resp.json().get("Browser", "")
+        if "Firefox" in browser:
+            return "firefox"
+        if "Chrome" in browser or "Chromium" in browser:
+            return "chrome"
+    except Exception:
+        pass
+    return None
+
+
+def _firefox_list_tabs(port):
+    """Return page/tab target dicts from Firefox CDP."""
+    try:
+        resp = requests.get(f"http://localhost:{port}/json/list", timeout=2)
+        return [t for t in resp.json()
+                if t.get("webSocketDebuggerUrl") and t.get("type") in ("tab", "page")]
+    except Exception:
+        return []
+
+
+def _get_firefox_session():
+    """Return active Firefox CDP session, auto-connecting if Firefox is on a known debug port."""
+    global _firefox_cdp_session
+    if _firefox_cdp_session is not None:
+        try:
+            _firefox_cdp_session.evaluate("1")
+            return _firefox_cdp_session
+        except Exception:
+            _firefox_cdp_session.close()
+            _firefox_cdp_session = None
+    import socket as _sock
+    for port in CDP_PORTS:
+        try:
+            s = _sock.create_connection(("127.0.0.1", port), timeout=0.5)
+            s.close()
+        except OSError:
+            continue
+        if _detect_browser_on_port(port) == "firefox":
+            tabs = _firefox_list_tabs(port)
+            if tabs:
+                _firefox_cdp_session = FirefoxCDPSession(port, tabs[0]["webSocketDebuggerUrl"])
+                return _firefox_cdp_session
+    return None
+
 
 def _get_page():
-    global _playwright_instance, _browser_instance, _page_instance
+    global _playwright_instance, _browser_instance, _page_instance, _browser_owned, _cdp_attach_failed_reason
+    import socket
     from playwright.sync_api import sync_playwright
     if _playwright_instance is None:
         _playwright_instance = sync_playwright().start()
-        _browser_instance = _playwright_instance.chromium.launch(headless=False)
-        _page_instance = _browser_instance.new_page()
+        connected = False
+        for port in CDP_PORTS:
+            # Quick TCP probe — avoids a slow Playwright timeout on a closed port
+            try:
+                s = socket.create_connection(("127.0.0.1", port), timeout=0.5)
+                s.close()
+            except OSError:
+                continue
+            # Skip Firefox ports — handled via FirefoxCDPSession, not Playwright
+            if _detect_browser_on_port(port) == "firefox":
+                continue
+            try:
+                _browser_instance = _playwright_instance.chromium.connect_over_cdp(f"http://localhost:{port}")
+                _browser_owned = False
+                contexts = _browser_instance.contexts
+                if contexts and contexts[0].pages:
+                    _page_instance = contexts[0].pages[0]
+                else:
+                    ctx = contexts[0] if contexts else _browser_instance.new_context()
+                    _page_instance = ctx.new_page()
+                connected = True
+                _cdp_attach_failed_reason = None
+                break
+            except Exception as e:
+                _cdp_attach_failed_reason = f"port {port} is open but CDP attach failed: {e}"
+        if not connected:
+            if not _cdp_attach_failed_reason:
+                _cdp_attach_failed_reason = f"No Chrome/Chromium found on ports {CDP_PORTS}. Start Chrome with: google-chrome --remote-debugging-port=9222"
+            _browser_instance = _playwright_instance.chromium.launch(headless=False)
+            _page_instance = _browser_instance.new_page()
+            _browser_owned = True
     return _page_instance
 
-def browser_navigate(url):
+def _match_domain(page_url, target_url):
+    from urllib.parse import urlparse
     try:
-        page = _get_page()
-        page.goto(url, timeout=15000)
-        return f"Navigated to: {page.title()}"
+        p = urlparse(page_url).netloc.lstrip("www.")
+        t = urlparse(target_url).netloc.lstrip("www.")
+        return p and t and (p == t or p.endswith("." + t) or t.endswith("." + p))
+    except Exception:
+        return False
+
+def _get_domain(url):
+    from urllib.parse import urlparse
+    try:
+        return urlparse(url).netloc.lstrip("www.").split(':')[0]
+    except Exception:
+        return ""
+
+def _wmctrl_windows():
+    """Return [(wid, title)] for all X11 windows via wmctrl, or [] if unavailable."""
+    try:
+        r = subprocess.run(['wmctrl', '-l'], capture_output=True, text=True, timeout=3)
+        if r.returncode == 0:
+            rows = []
+            for line in r.stdout.splitlines():
+                parts = line.split(None, 3)
+                if len(parts) >= 4:
+                    rows.append((parts[0], parts[3]))
+            return rows
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+    return []
+
+def _browser_type_from_title(title):
+    t = title.lower()
+    if 'firefox' in t or 'mozilla firefox' in t:
+        return 'firefox'
+    if 'google chrome' in t or 'chromium' in t:
+        return 'chrome'
+    return None
+
+def _find_domain_in_windows(domain, windows):
+    """
+    Search open windows for a browser whose title contains the domain.
+    Returns (browser_type, wid, title) prioritising Firefox, or (None, None, None).
+    """
+    firefox_match = chrome_match = None
+    for wid, title in windows:
+        if domain.lower() not in title.lower():
+            continue
+        bt = _browser_type_from_title(title)
+        if bt == 'firefox' and not firefox_match:
+            firefox_match = ('firefox', wid, title)
+        elif bt == 'chrome' and not chrome_match:
+            chrome_match = ('chrome', wid, title)
+    return firefox_match or chrome_match or (None, None, None)
+
+def _first_running_browser(windows):
+    """
+    Return (browser_type, wid) for the first Firefox or Chrome window found
+    (Firefox preferred). Falls back to pgrep if wmctrl found nothing.
+    Returns (None, None) if no browser is running.
+    """
+    firefox = chrome = None
+    for wid, title in windows:
+        bt = _browser_type_from_title(title)
+        if bt == 'firefox' and not firefox:
+            firefox = ('firefox', wid)
+        elif bt == 'chrome' and not chrome:
+            chrome = ('chrome', wid)
+    result = firefox or chrome
+    if result:
+        return result
+    for pname, bt in [('firefox', 'firefox'), ('google-chrome', 'chrome'), ('chromium-browser', 'chrome')]:
+        try:
+            r = subprocess.run(['pgrep', '-f', pname], capture_output=True, timeout=2)
+            if r.returncode == 0:
+                return (bt, None)
+        except Exception:
+            pass
+    return (None, None)
+
+def _activate_window(wid):
+    """Raise a window to the front via wmctrl or xdotool."""
+    for cmd in [['wmctrl', '-ia', wid], ['xdotool', 'windowactivate', '--sync', wid]]:
+        try:
+            subprocess.run(cmd, timeout=3, check=True, capture_output=True)
+            return True
+        except Exception:
+            continue
+    return False
+
+def browser_navigate(url):
+    global _page_instance, _firefox_cdp_session, _browser_instance, _playwright_instance, _browser_owned, _cdp_attach_failed_reason
+    try:
+        import socket
+        windows = _wmctrl_windows()
+        domain = _get_domain(url)
+
+        # 1. Firefox CDP (preferred) — attach to existing Firefox with --remote-debugging-port
+        for port in CDP_PORTS:
+            try:
+                s = socket.create_connection(("127.0.0.1", port), timeout=0.5)
+                s.close()
+            except OSError:
+                continue
+            if _detect_browser_on_port(port) != "firefox":
+                continue
+            tabs = _firefox_list_tabs(port)
+            target_tab = None
+            if domain:
+                for tab in tabs:
+                    if domain in tab.get("url", ""):
+                        target_tab = tab
+                        break
+            if target_tab:
+                # Domain already open — connect to that tab
+                if _firefox_cdp_session is not None:
+                    _firefox_cdp_session.reconnect(target_tab["webSocketDebuggerUrl"])
+                else:
+                    _firefox_cdp_session = FirefoxCDPSession(port, target_tab["webSocketDebuggerUrl"])
+                _, wid, _ = _find_domain_in_windows(domain, windows)
+                if not wid:
+                    for wid2, t in windows:
+                        if "firefox" in t.lower():
+                            wid = wid2
+                            break
+                if wid:
+                    _activate_window(wid)
+                return f"Switched to existing Firefox tab: {target_tab.get('title', '')} ({target_tab.get('url', '')})"
+            # Domain not open — navigate in Firefox
+            if _firefox_cdp_session is None:
+                if not tabs:
+                    return "Firefox is running with remote debugging but has no open tabs."
+                _firefox_cdp_session = FirefoxCDPSession(port, tabs[0]["webSocketDebuggerUrl"])
+            _firefox_cdp_session.navigate(url)
+            title = _firefox_cdp_session.title()
+            _, running_wid = _first_running_browser(windows)
+            if running_wid:
+                _activate_window(running_wid)
+            return f"Navigated Firefox to: {title}"
+
+        # 2. Playwright session already live (Chrome/Chromium)
+        if _browser_instance is not None:
+            if not _browser_owned:
+                for ctx in _browser_instance.contexts:
+                    for p in ctx.pages:
+                        try:
+                            if _match_domain(p.url, url):
+                                _page_instance = p
+                                p.bring_to_front()
+                                return f"Switched to existing tab: {p.title()} ({p.url})"
+                        except Exception:
+                            pass
+            _page_instance.goto(url, timeout=15000)
+            return f"Navigated to: {_page_instance.title()}"
+
+        # 3. Firefox running but without remote debugging
+        running_bt, running_wid = _first_running_browser(windows)
+        if running_bt == "firefox":
+            try:
+                subprocess.Popen(["firefox", url])
+                if running_wid:
+                    _activate_window(running_wid)
+            except Exception:
+                pass
+            return (
+                f"Opened {url} in Firefox, but interactive tools (fill, click, read) are unavailable. "
+                "To enable full interaction, start Firefox with: firefox --remote-debugging-port=9222"
+            )
+
+        # 4. Chrome CDP or headless Chromium fallback
+        _get_page()
+        if not _browser_owned:
+            for ctx in _browser_instance.contexts:
+                for p in ctx.pages:
+                    try:
+                        if _match_domain(p.url, url):
+                            _page_instance = p
+                            p.bring_to_front()
+                            return f"Switched to existing tab: {p.title()} ({p.url})"
+                    except Exception:
+                        pass
+        _page_instance.goto(url, timeout=15000)
+        note = ""
+        if _browser_owned and _cdp_attach_failed_reason:
+            note = f" [Note: {_cdp_attach_failed_reason}]"
+        return f"Navigated to: {_page_instance.title()}{note}"
+
     except Exception as e:
         return f"Error: {str(e)}"
 
-def browser_fill(label, text):
-    try:
-        page = _get_page()
-        page.get_by_placeholder(label).fill(text)
-        return f"Filled '{label}' with '{text}'"
-    except Exception:
+def browser_fill(label, text, selector=None):
+    session = _get_firefox_session()
+    if session is not None:
+        lbl = json.dumps(label)
+        val = json.dumps(text)
+        if selector:
+            sel = json.dumps(selector)
+            expr = f"""(function(){{
+                var el = document.querySelector({sel});
+                if (!el) return 'not_found';
+                el.focus(); el.value = {val};
+                el.dispatchEvent(new Event('input', {{bubbles:true}}));
+                el.dispatchEvent(new Event('change', {{bubbles:true}}));
+                return 'filled';
+            }})()"""
+        else:
+            expr = f"""(function(){{
+                var label = {lbl}, val = {val}, found = null;
+                for (var inp of document.querySelectorAll('input,textarea')) {{
+                    if (inp.placeholder && inp.placeholder.toLowerCase() === label.toLowerCase()) {{ found = inp; break; }}
+                }}
+                if (!found) {{
+                    for (var inp of document.querySelectorAll('[aria-label]')) {{
+                        if (inp.getAttribute('aria-label').toLowerCase() === label.toLowerCase()) {{ found = inp; break; }}
+                    }}
+                }}
+                if (!found) found = document.querySelector('input[name=' + JSON.stringify(label) + '],textarea[name=' + JSON.stringify(label) + ']');
+                if (!found) {{
+                    var el = document.getElementById(label);
+                    if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) found = el;
+                }}
+                if (!found) {{
+                    for (var lbl of document.querySelectorAll('label')) {{
+                        if (lbl.textContent.trim().toLowerCase().includes(label.toLowerCase())) {{
+                            found = lbl.control || document.getElementById(lbl.htmlFor);
+                            if (found) break;
+                        }}
+                    }}
+                }}
+                if (!found) found = document.querySelector('input[type="search"],input[type="text"],textarea');
+                if (!found) return 'not_found';
+                found.focus(); found.value = val;
+                found.dispatchEvent(new Event('input', {{bubbles:true}}));
+                found.dispatchEvent(new Event('change', {{bubbles:true}}));
+                return 'filled';
+            }})()"""
+        result = session.evaluate(expr)
+        if result == "filled":
+            return f"Filled field with '{text}'"
+        return f"Could not find field '{label}'. Use browser_inspect_forms to see available fields, then retry with selector=."
+    page = _get_page()
+    if selector:
         try:
-            page.get_by_label(label).fill(text)
-            return f"Filled '{label}' with '{text}'"
+            page.locator(selector).fill(text)
+            return f"Filled '{selector}' with '{text}'"
         except Exception as e:
-            return f"Could not find field '{label}': {str(e)}"
-
-def browser_click(text):
-    try:
-        page = _get_page()
-        page.get_by_role("button", name=text).click()
-        return f"Clicked button '{text}'"
-    except Exception:
+            return f"Could not fill '{selector}': {str(e)}"
+    errors = []
+    for attempt in [
+        lambda: page.get_by_placeholder(label).fill(text),
+        lambda: page.get_by_label(label).fill(text),
+        lambda: page.locator(f"input[aria-label='{label}']").fill(text),
+        lambda: page.locator(f"input[name='{label}']").fill(text),
+        lambda: page.locator(f"input[id='{label}']").fill(text),
+        lambda: page.locator(f"input[type='search']").first.fill(text),
+        lambda: page.locator("input[type='text']").first.fill(text),
+    ]:
         try:
-            page.get_by_text(text).first.click()
+            attempt()
+            return f"Filled field with '{text}'"
+        except Exception as e:
+            errors.append(str(e))
+    return f"Could not find field '{label}'. Use browser_inspect_forms to see available fields, then retry with selector=. Last error: {errors[-1]}"
+
+def browser_click(text, selector=None):
+    session = _get_firefox_session()
+    if session is not None:
+        txt = json.dumps(text)
+        if selector:
+            sel = json.dumps(selector)
+            expr = f"""(function(){{
+                var el = document.querySelector({sel});
+                if (!el) return 'not_found';
+                el.click();
+                return 'clicked';
+            }})()"""
+        else:
+            expr = f"""(function(){{
+                var text = {txt};
+                for (var el of document.querySelectorAll('button,input[type="submit"],input[type="button"],a,[role="button"]')) {{
+                    var t = (el.textContent || el.value || '').trim();
+                    if (t.toLowerCase().includes(text.toLowerCase())) {{ el.click(); return 'clicked'; }}
+                }}
+                return 'not_found';
+            }})()"""
+        result = session.evaluate(expr)
+        if result == "clicked":
+            return f"Clicked '{text}'"
+        return f"Could not click '{text}'. Use browser_inspect_forms to see available buttons, then retry with selector=."
+    page = _get_page()
+    if selector:
+        try:
+            page.locator(selector).click()
+            return f"Clicked '{selector}'"
+        except Exception as e:
+            return f"Could not click '{selector}': {str(e)}"
+    errors = []
+    for attempt in [
+        lambda: page.get_by_role("button", name=text).click(),
+        lambda: page.locator(f"input[type='submit'][value='{text}']").click(),
+        lambda: page.locator("input[type='submit']").first.click(),
+        lambda: page.get_by_text(text).first.click(),
+    ]:
+        try:
+            attempt()
             return f"Clicked '{text}'"
         except Exception as e:
-            return f"Could not click '{text}': {str(e)}"
+            errors.append(str(e))
+    return f"Could not click '{text}'. Use browser_inspect_forms to see available buttons, then retry with selector=. Last error: {errors[-1]}"
+
+def browser_inspect_forms():
+    session = _get_firefox_session()
+    if session is not None:
+        try:
+            data = session.evaluate("""Array.from(document.querySelectorAll('input,textarea,select,button,[role="button"]')).map(el => {
+                var attrs = {};
+                for (var a of el.attributes) attrs[a.name] = a.value;
+                return {tag: el.tagName.toLowerCase(), attrs: attrs, text: (el.innerText||'').trim().slice(0,80)};
+            })""")
+            if not data:
+                return "No form elements found on this page."
+            lines = []
+            for el in data:
+                attrs_str = " ".join(f'{k}="{v}"' for k, v in el.get("attrs", {}).items())
+                inner = f' (text: "{el["text"]}")' if el.get("text") else ""
+                lines.append(f'<{el["tag"]} {attrs_str}>{inner}')
+            return "\n".join(lines)
+        except Exception as e:
+            return f"Error inspecting forms: {str(e)}"
+    try:
+        page = _get_page()
+        html = page.evaluate("""() => {
+            const els = document.querySelectorAll('input, textarea, select, button, [role="button"]');
+            return Array.from(els).map(el => {
+                const attrs = {};
+                for (const a of el.attributes) attrs[a.name] = a.value;
+                return { tag: el.tagName.toLowerCase(), attrs, text: el.innerText?.trim().slice(0, 80) || '' };
+            });
+        }""")
+        if not html:
+            return "No form elements found on this page."
+        lines = []
+        for el in html:
+            attrs_str = " ".join(f'{k}="{v}"' for k, v in el["attrs"].items())
+            inner = f' (text: "{el["text"]}")' if el["text"] else ""
+            lines.append(f'<{el["tag"]} {attrs_str}>{inner}')
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error inspecting forms: {str(e)}"
 
 def browser_read():
+    session = _get_firefox_session()
+    if session is not None:
+        try:
+            title = session.title()
+            text = session.evaluate("document.body.innerText") or ""
+            text = text[:5000] if len(text) > 5000 else text
+            return f"Title: {title}\n\n{text}"
+        except Exception as e:
+            return f"Error reading page: {str(e)}"
     try:
         page = _get_page()
         title = page.title()
@@ -510,18 +1006,31 @@ def browser_read():
         return f"Error reading page: {str(e)}"
 
 def browser_close():
-    global _playwright_instance, _browser_instance, _page_instance
+    global _playwright_instance, _browser_instance, _page_instance, _browser_owned, _firefox_cdp_session
+    msgs = []
+    if _firefox_cdp_session is not None:
+        try:
+            _firefox_cdp_session.close()
+        except Exception:
+            pass
+        _firefox_cdp_session = None
+        msgs.append("Disconnected from Firefox (your browser window is still open).")
+    had_playwright = _playwright_instance is not None
+    owned = _browser_owned
     try:
-        if _browser_instance:
+        if _browser_owned and _browser_instance:
             _browser_instance.close()
         if _playwright_instance:
             _playwright_instance.stop()
-        _playwright_instance = None
-        _browser_instance = None
-        _page_instance = None
-        return "Browser closed."
     except Exception as e:
-        return f"Error closing browser: {str(e)}"
+        msgs.append(f"Error closing Chromium: {str(e)}")
+    _playwright_instance = None
+    _browser_instance = None
+    _page_instance = None
+    _browser_owned = False
+    if had_playwright:
+        msgs.append("Browser closed." if owned else "Disconnected from Chrome (your browser window is still open).")
+    return " ".join(msgs) if msgs else "No browser session to close."
 
 def fetch_url(url):
     try:
@@ -962,7 +1471,7 @@ tools = [
     },
     {
         "name": "browser_navigate",
-        "description": "Open a URL in a headless Chromium browser. Use this to start a browsing session or navigate to a new page.",
+        "description": "Navigate to a URL. Checks in order: (1) scan all open Firefox and Chrome windows for the domain — if found, activates that window (Firefox preferred); (2) if a Playwright browser session is already live, use it; (3) if Firefox is running but not at the domain, open a new tab there; (4) try CDP attachment to Chrome on port 9222/9223; (5) fall back to a new headless Chromium. Never opens a new browser window when one is already available at the requested site.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -973,25 +1482,35 @@ tools = [
     },
     {
         "name": "browser_fill",
-        "description": "Type text into a form field identified by its placeholder or label text. Use after browser_navigate.",
+        "description": "Type text into a form field. First tries to find the field by placeholder, label, aria-label, name, id, or type. If that fails, use browser_inspect_forms to see available fields, then pass a CSS selector via the selector parameter (e.g. selector='input[name=\"isbn\"]').",
         "input_schema": {
             "type": "object",
             "properties": {
-                "label": {"type": "string", "description": "The placeholder or label text of the field to fill"},
-                "text": {"type": "string", "description": "The text to type into the field"}
+                "label": {"type": "string", "description": "The placeholder, label, aria-label, name, or id of the field to fill"},
+                "text": {"type": "string", "description": "The text to type into the field"},
+                "selector": {"type": "string", "description": "Optional CSS selector to target the field directly, e.g. input[name='q'] or #search-box. Use this when label matching fails."}
             },
             "required": ["label", "text"]
         }
     },
     {
         "name": "browser_click",
-        "description": "Click a button or link on the current page by its visible text.",
+        "description": "Click a button, submit input, or link on the current page by its visible text. If clicking fails, use browser_inspect_forms to find the element, then pass a CSS selector via the selector parameter.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "text": {"type": "string", "description": "The visible text of the button or link to click"}
+                "text": {"type": "string", "description": "The visible text of the button or link to click"},
+                "selector": {"type": "string", "description": "Optional CSS selector to click directly, e.g. input[type='submit'] or button.search-btn. Use this when text matching fails."}
             },
             "required": ["text"]
+        }
+    },
+    {
+        "name": "browser_inspect_forms",
+        "description": "List all interactive form elements on the current page (inputs, textareas, selects, buttons) with their HTML attributes. Use this when browser_fill or browser_click can't find a field, to discover the correct name, id, placeholder, or type to use as a selector.",
+        "input_schema": {
+            "type": "object",
+            "properties": {}
         }
     },
     {
@@ -1135,9 +1654,11 @@ def execute_tool(tool_name, tool_input):
     elif tool_name == "browser_navigate":
         return browser_navigate(tool_input["url"])
     elif tool_name == "browser_fill":
-        return browser_fill(tool_input["label"], tool_input["text"])
+        return browser_fill(tool_input["label"], tool_input["text"], tool_input.get("selector"))
     elif tool_name == "browser_click":
-        return browser_click(tool_input["text"])
+        return browser_click(tool_input["text"], tool_input.get("selector"))
+    elif tool_name == "browser_inspect_forms":
+        return browser_inspect_forms()
     elif tool_name == "browser_read":
         return browser_read()
     elif tool_name == "browser_close":
@@ -1189,6 +1710,10 @@ Always tell Vernie what you found, not just that you looked.
 When sending any email, always prefix the subject line with "[Nuncio] " and append the following line at the very bottom of the email body: "Email sent by Nuncio, Vernie's agent".
 You can send Vernie a Telegram message directly using the send_telegram_message tool — use this for notifications or when running headlessly.
 You have access to a local inbox folder at {NUNCIO_FOLDER}. Use the list_files tool to see what files are inside it. Only use read_file on specific files returned by list_files, never on folder paths.
+When Vernie sends a block of text that is clearly the beginning of a longer piece — for example, a numbered list with only the first item, a sentence that ends mid-thought, or an email body that seems to start but not finish — respond with ONLY the single word "Continue." Do not ask "is this complete?", do not attempt to send anything, do not add commentary. Keep responding "Continue." for each subsequent chunk until Vernie signals she is done (e.g. "done", "send it", "that's all", "go ahead"). When she signals done, look back through the conversation history to assemble every chunk she sent into the complete text, then proceed with the task using that reconstructed text.
+
+## Browser
+Firefox is the preferred browser. Nuncio connects directly to Vernie's running Firefox via CDP when Firefox is started with --remote-debugging-port (port 9222 or 9223). When connected, all tools (fill, click, read, navigate) work against the live Firefox session — including tabs that are already open to the right site. If Firefox is running but not with remote debugging, tell Vernie to restart it with: firefox --remote-debugging-port=9222. Chrome/Chromium is the fallback if Firefox is unavailable.
 
 ## Book Scout
 {_book_scout_status}
@@ -1218,7 +1743,7 @@ When Vernie asks for a book search, or confirms she wants one, call the run_book
             })
 
             tool_call_counts = {}
-            MAX_TOOL_RETRIES = 3
+            MAX_TOOL_RETRIES = 8
 
             while True:
                 for attempt in range(3):
