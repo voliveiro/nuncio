@@ -1149,10 +1149,15 @@ Search Publishers Weekly, The Guardian Books, Literary Hub, Tor.com, Locus Magaz
 Append '{month_terms}' or '{prev_month_terms}' to search queries to bias toward recent content.
 Check for new releases by the favourite authors listed in the preferences.
 Search across all categories (favourite authors, sci-fi, fantasy, literary fiction, non-fiction) before compiling anything.
-Only compile the digest once you have 6–10 confirmed books within the recency window.
+Aim for 6–10 confirmed books within the recency window. If you cannot find that many, include the best matches you found regardless.
 
 Format each entry as: **Title** — Author (Publisher, date) followed by 2–3 sentences on why it matches Vernie's taste.
-Output ONLY the formatted digest. No preamble, no commentary, nothing else."""
+
+CRITICAL RULES — failure to follow these will break the system:
+- Output ONLY the formatted digest. Nothing before it, nothing after it.
+- Do NOT narrate your search process or reasoning.
+- Do NOT ask clarifying questions or request parameter adjustments. This is an automated report — there is no one to answer.
+- Do NOT explain what you could not find. Just output the books you did find."""
 
     scout_messages = [{
         "role": "user",

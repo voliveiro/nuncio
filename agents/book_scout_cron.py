@@ -16,12 +16,21 @@ if not os.environ.get('ANTHROPIC_API_KEY'):
             os.environ['ANTHROPIC_API_KEY'] = f.read().strip()
 
 sys.path.insert(0, os.path.dirname(__file__))
-from nuncio import run_book_scout, send_email, append_action_log
+from nuncio import run_book_scout, send_email, append_action_log, get_book_scout_status
 
 RECIPIENT = "vernie.oliveiro@gmail.com"
+INTERVAL_DAYS = 7
 
 def main():
     print(f"[{datetime.datetime.now().isoformat()}] Book scout cron starting.")
+
+    last_run = get_book_scout_status()
+    if last_run != "never":
+        last_date = datetime.datetime.strptime(last_run, "%Y-%m-%d")
+        days_ago = (datetime.datetime.now() - last_date).days
+        if days_ago < INTERVAL_DAYS:
+            print(f"[book_scout_cron] Last run was {days_ago} days ago — skipping until {INTERVAL_DAYS} days have passed.")
+            return
 
     try:
         digest = run_book_scout()
