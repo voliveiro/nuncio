@@ -52,13 +52,39 @@ def run_book_scout():
 Today's date is {today.strftime('%d %B %Y')}.
 Recency cutoff: only include books with reviews or announcements published on or after {cutoff}. Skip anything older — if you cannot confirm the date, skip it.
 
-Search Publishers Weekly, The Guardian Books, Literary Hub, Tor.com, Locus Magazine, and the New Statesman.
-Append '{month_terms}' or '{prev_month_terms}' to search queries to bias toward recent content.
-Check for new releases by the favourite authors listed in the preferences.
-Search across all categories (favourite authors, sci-fi, fantasy, literary fiction, non-fiction) before compiling anything.
-Aim for 6–10 confirmed books within the recency window. If you cannot find that many, include the best matches you found regardless.
+You must search and report across exactly four categories. Search each category thoroughly before compiling results.
 
-Format each entry as: **Title** — Author (Publisher, date) followed by 2–3 sentences on why it matches Vernie's taste.
+CATEGORY 1 — FICTION
+Sources: Publishers Weekly, The Guardian Books, Literary Hub, Tor.com, Locus Magazine.
+Includes: sci-fi, fantasy, literary fiction. Check for new releases by favourite authors first.
+Append '{month_terms}' or '{prev_month_terms}' to queries to bias toward recent content.
+
+CATEGORY 2 — RELIGION & SPIRITUALITY
+Sources: Commonweal, America Magazine, Church Times, The Tablet, Publishers Weekly religion section.
+Includes: Catholic and Orthodox theology, spirituality, contemplative writing, Jesuit tradition, ecumenism.
+Authors to watch: James Martin SJ, Rowan Williams, and others in the preferences.
+
+CATEGORY 3 — HISTORY
+Sources: The Guardian Books, Literary Review, London Review of Books, Publishers Weekly.
+Includes: Roman/Byzantine/medieval, 20th century (Soviet, Cold War, Southeast Asia), any period matching preferences.
+
+CATEGORY 4 — CURRENT AFFAIRS
+Sources: The Guardian, New Statesman, Foreign Affairs, The Atlantic, Prospect Magazine.
+Includes: politics, democracy, technology and society, AI, geopolitics.
+
+For each category, return a minimum of 3 and a maximum of 6 books. If you cannot find 3 confirmed books within the recency window for a category, include the most recent matches you found regardless of date, clearly noting they may be slightly older.
+
+Output format — use exactly these section headers:
+
+## Fiction
+
+## Religion & Spirituality
+
+## History
+
+## Current Affairs
+
+Within each section, format each entry as: **Title** — Author (Publisher, date) followed by 2–3 sentences on why it matches Vernie's taste.
 
 CRITICAL RULES — failure to follow these will break the system:
 - Output ONLY the formatted digest. Nothing before it, nothing after it.

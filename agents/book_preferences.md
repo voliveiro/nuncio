@@ -38,8 +38,15 @@
 - 20th century: Soviet Union, Cold War, Afghanistan, Ukraine
 - Southeast and East Asian history
 
-### Faith and ideas
-- Catholic and Jesuit intellectual tradition (recent and growing interest)
+### Religion and spirituality — high priority
+- Catholic and Orthodox Christian theology and spirituality
+- Favourite voices: James Martin SJ, Henri Nouwen, Thomas Merton, Rowan Williams, Metropolitan Kallistos Ware
+- Jesuit intellectual tradition, ignatian spirituality
+- Contemplative prayer, mysticism, desert fathers
+- Ecumenical dialogue, Catholic social teaching
+- Philosophy of religion, ethics, political theology
+
+### Philosophy and ideas
 - Philosophy of liberalism, communitarianism
 - Ethics, political philosophy
 
