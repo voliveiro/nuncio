@@ -16,7 +16,8 @@ if not os.environ.get('ANTHROPIC_API_KEY'):
             os.environ['ANTHROPIC_API_KEY'] = f.read().strip()
 
 sys.path.insert(0, os.path.dirname(__file__))
-from nuncio import run_book_scout, send_email, append_action_log, get_book_scout_status
+from book_scout import run_book_scout, get_book_scout_status
+from nuncio import send_email, append_action_log
 
 RECIPIENT = "vernie.oliveiro@gmail.com"
 INTERVAL_DAYS = 7
