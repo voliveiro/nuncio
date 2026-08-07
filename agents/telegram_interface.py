@@ -11,8 +11,10 @@ Messages are tagged [Via Telegram] in history so Nuncio knows the source.
 """
 
 import asyncio
+import base64
 import datetime
 import json
+import mimetypes
 import os
 import sys
 import threading
@@ -161,33 +163,24 @@ def run_nuncio_turn(user_input: str, chat_id: int) -> str:
     memory_section = n.load_memory_for_prompt()
     book_scout_status = n.book_scout_prompt_fragment()
 
-    system_prompt = f"""You are Nuncio, an AI agent with delegated authority to act on behalf of your principal, Vernie.
-Today's date is {datetime.datetime.now().strftime("%A, %d %B %Y")}.
-You are precise, loyal, and operate within clearly defined boundaries.
-You are informed by Jesuit Catholic values.
-You have access to Vernie's calendar, Gmail, Google Drive, and local filesystem.
-You can search the web and fetch URLs to find current information, news, and research when Vernie asks about external topics.
-Use your tools whenever a question requires real data.
-Always tell Vernie what you found, not just that you looked.
-If a tool returns an error, an empty result, or no usable data, tell Vernie that plainly — never fabricate or infer information that the tool did not actually return.
-When sending any email, always prefix the subject line with "[Nuncio] " and append the following line at the very bottom of the email body: "Email sent by Nuncio, Vernie's agent".
-You have access to a local inbox folder at {n.NUNCIO_FOLDER}. Use the list_files tool to see what files are inside it. Only use read_file on specific files returned by list_files, never on folder paths.
-This message came via Telegram. You can send Vernie proactive Telegram messages using the send_telegram_message tool.
-When Vernie sends a block of text that is clearly the beginning of a longer piece — for example, a numbered list with only the first item, a sentence that ends mid-thought, or an email body that seems to start but not finish — respond with ONLY the single word "Continue." Do not ask "is this complete?", do not attempt to send anything, do not add commentary. Keep responding "Continue." for each subsequent chunk until Vernie signals she is done (e.g. "done", "send it", "that's all", "go ahead"). When she signals done, look back through the conversation history to assemble every chunk she sent into the complete text, then proceed with the task using that reconstructed text.
+    _soul_path = os.path.join(os.path.dirname(__file__), 'soul.md')
+    with open(_soul_path) as _f:
+        _soul_template = _f.read()
+    system_prompt = _soul_template.format(
+        today=datetime.datetime.now().strftime("%A, %d %B %Y"),
+        nuncio_folder=n.NUNCIO_FOLDER,
+        book_scout_status=book_scout_status,
+        memory_section=memory_section,
+    )
+    system_prompt += "\nThis conversation is via Telegram. You can send Vernie proactive Telegram messages using the send_telegram_message tool."
 
-## Browser
-Chrome is the preferred browser. Nuncio attaches to Vernie's running Chrome via CDP when started with --remote-debugging-port=9222, and will reuse an already-open tab for the same domain automatically. Firefox is a fallback if Chrome is unavailable. If browser_navigate returns a note saying it fell back to headless or Firefox, give the exact command to enable Chrome CDP: google-chrome --remote-debugging-port=9222. Do not claim the browser tool always opens a separate session without checking — the tool result will say if a fallback occurred and why.
-
-## Book Scout
-{book_scout_status}
-When Vernie asks for a book search, or confirms she wants one, call the run_book_scout tool. It will spin up a specialist search agent that does all the research and returns a formatted digest — you do not need to search yourself. Present the digest to Vernie as-is when it arrives.
-
-{memory_section}
-"""
-
+    if isinstance(user_input, list):
+        user_content = user_input  # multimodal — caller includes [Via Telegram] in text block
+    else:
+        user_content = [{"type": "text", "text": f"[Via Telegram] {user_input}"}]
     conversation_history.append({
         "role": "user",
-        "content": [{"type": "text", "text": f"[Via Telegram] {user_input}"}],
+        "content": user_content,
     })
 
     tool_call_counts: dict[str, int] = {}
@@ -383,17 +376,30 @@ async def handle_file(update: Update, context) -> None:
         return
 
     caption = update.message.caption or ""
-    user_text = f"I've attached a file: {file_path}"
-    if caption:
-        user_text = f"{caption}\n\n[Attached file saved to: {file_path}]"
+
+    # Determine if Claude can view this as an image
+    VIEWABLE = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+    is_photo = bool(update.message.photo)
+    media_type = "image/jpeg" if is_photo else (mimetypes.guess_type(file_path)[0] or "")
+    is_image = media_type in VIEWABLE
+
+    if is_image:
+        with open(file_path, "rb") as img_f:
+            image_data = base64.standard_b64encode(img_f.read()).decode("utf-8")
+        text = caption if caption else "I've sent you this image — what would you like me to do with it?"
+        user_content = [
+            {"type": "text", "text": f"[Via Telegram] {text}\n[Image saved to: {file_path}]"},
+            {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": image_data}},
+        ]
     else:
-        user_text = f"[Attached file saved to: {file_path}] — what would you like me to do with it?"
+        text = f"{caption}\n\n[Attached file saved to: {file_path}]" if caption else f"[Attached file saved to: {file_path}] — what would you like me to do with it?"
+        user_content = f"[Via Telegram] {text}"
 
     async with _turn_lock:
         await context.bot.send_chat_action(chat_id, "typing")
         loop = asyncio.get_running_loop()
         try:
-            reply = await loop.run_in_executor(None, run_nuncio_turn, user_text, chat_id)
+            reply = await loop.run_in_executor(None, run_nuncio_turn, user_content, chat_id)
         except Exception as e:
             await context.bot.send_message(chat_id, f"⚠️ Nuncio encountered an error: {e}")
             return
