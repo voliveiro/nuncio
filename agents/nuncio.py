@@ -1042,7 +1042,7 @@ def browser_read():
             try:
                 title = session.title()
                 text = session.evaluate("document.body.innerText") or ""
-                text = text[:5000] if len(text) > 5000 else text
+                text = text[:20000] if len(text) > 20000 else text
                 return f"Title: {title}\n\n{text}"
             except Exception as e:
                 return f"Error reading page: {str(e)}"
@@ -1050,7 +1050,7 @@ def browser_read():
         page = _get_page()
         title = page.title()
         text = page.inner_text("body")
-        text = text[:5000] if len(text) > 5000 else text
+        text = text[:20000] if len(text) > 20000 else text
         return f"Title: {title}\n\n{text}"
     except Exception as e:
         return f"Error reading page: {str(e)}"
@@ -1082,6 +1082,73 @@ def browser_close():
         msgs.append("Browser closed." if owned else "Disconnected from Chrome (your browser window is still open).")
     return " ".join(msgs) if msgs else "No browser session to close."
 
+def browser_scroll(direction="down", pixels=800):
+    _JS = {
+        "down":   lambda p: f"window.scrollBy(0, {p})",
+        "up":     lambda p: f"window.scrollBy(0, -{p})",
+        "bottom": lambda p: "window.scrollTo(0, document.body.scrollHeight)",
+        "top":    lambda p: "window.scrollTo(0, 0)",
+    }
+    if direction not in _JS:
+        return f"Unknown direction '{direction}'. Use: down, up, top, bottom."
+    expr = _JS[direction](pixels)
+    try:
+        if not _chrome_available():
+            session = _get_firefox_session()
+            if session is not None:
+                session.evaluate(expr)
+                return f"Scrolled {direction}."
+        page = _get_page()
+        page.evaluate(expr)
+        return f"Scrolled {direction}."
+    except Exception as e:
+        return f"Scroll error: {str(e)}"
+
+def browser_get_html(selector=None):
+    LIMIT = 50000
+    try:
+        if not _chrome_available():
+            session = _get_firefox_session()
+            if session is not None:
+                if selector:
+                    expr = f"(function(){{var el=document.querySelector({json.dumps(selector)});return el?el.outerHTML:'not_found';}})()"
+                    html = session.evaluate(expr)
+                    if html == "not_found":
+                        return f"Element '{selector}' not found on page."
+                else:
+                    html = session.evaluate("document.documentElement.outerHTML") or ""
+                return html[:LIMIT] if len(html) > LIMIT else html
+        page = _get_page()
+        if selector:
+            try:
+                html = page.locator(selector).first.inner_html()
+            except Exception as e:
+                return f"Element '{selector}' not found: {str(e)}"
+        else:
+            html = page.content()
+        return html[:LIMIT] if len(html) > LIMIT else html
+    except Exception as e:
+        return f"Error getting HTML: {str(e)}"
+
+def browser_wait_for(selector, timeout=10):
+    try:
+        if not _chrome_available():
+            session = _get_firefox_session()
+            if session is not None:
+                import time as _time
+                deadline = _time.time() + timeout
+                while _time.time() < deadline:
+                    found = session.evaluate(f"document.querySelector({json.dumps(selector)}) !== null")
+                    if found:
+                        return f"Element '{selector}' found."
+                    _time.sleep(0.5)
+                return f"Timed out after {timeout}s waiting for '{selector}'."
+        page = _get_page()
+        page.wait_for_selector(selector, timeout=timeout * 1000)
+        return f"Element '{selector}' found."
+    except Exception as e:
+        return f"Timed out or error waiting for '{selector}': {str(e)}"
+
 def fetch_url(url):
     try:
         import urllib3
@@ -1100,7 +1167,7 @@ def fetch_url(url):
                 "retryable": False,
                 "detail": f"fetch_url returned no usable content from {url} — the page almost certainly requires JavaScript to render. You MUST use browser_navigate followed by browser_read instead. Do not report any findings until you have done this."
             })
-        return text[:8000] if len(text) > 8000 else text
+        return text[:30000] if len(text) > 30000 else text
     except Exception as e:
         reason, retryable = _classify_error(e)
         return json.dumps({"status": "error", "reason": reason, "retryable": retryable, "detail": str(e)})
@@ -1520,6 +1587,41 @@ tools = [
         }
     },
     {
+        "name": "browser_scroll",
+        "description": "Scroll the current browser page. Use 'down' or 'up' to scroll by pixels (default 800), or 'bottom'/'top' to jump to the end or start of the page. Use this to load lazy-loaded content or reveal content below the fold.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "direction": {"type": "string", "description": "One of: down, up, top, bottom", "enum": ["down", "up", "top", "bottom"]},
+                "pixels": {"type": "integer", "description": "Pixels to scroll for 'down' or 'up'. Ignored for 'top' and 'bottom'. Defaults to 800."}
+            },
+            "required": ["direction"]
+        }
+    },
+    {
+        "name": "browser_get_html",
+        "description": "Get the raw HTML of the current page or a specific element. Use this when you need structured content (tables, links, metadata) that browser_read's plain-text output would lose. Pass a CSS selector to target a specific element.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "selector": {"type": "string", "description": "Optional CSS selector to get HTML for a specific element, e.g. 'table.results' or '#main-content'. Omit to get the full page HTML."}
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "browser_wait_for",
+        "description": "Wait for a CSS selector to appear on the current page. Use this after browser_navigate on JS-heavy pages where content loads dynamically. Waits up to the specified timeout in seconds.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "selector": {"type": "string", "description": "CSS selector to wait for, e.g. '.results-list' or '#content-loaded'"},
+                "timeout": {"type": "integer", "description": "Maximum seconds to wait. Defaults to 10."}
+            },
+            "required": ["selector"]
+        }
+    },
+    {
         "name": "fetch_url",
         "description": "Fetch and read the content of a webpage given its URL. Use this to read research pages, news articles, or any specific URL Vernie provides. If the result is empty or clearly missing content, the page likely requires JavaScript to render — in that case, use browser_navigate followed by browser_read instead.",
         "input_schema": {
@@ -1653,6 +1755,12 @@ def execute_tool(tool_name, tool_input):
         return browser_read()
     elif tool_name == "browser_close":
         return browser_close()
+    elif tool_name == "browser_scroll":
+        return browser_scroll(tool_input.get("direction", "down"), tool_input.get("pixels", 800))
+    elif tool_name == "browser_get_html":
+        return browser_get_html(tool_input.get("selector"))
+    elif tool_name == "browser_wait_for":
+        return browser_wait_for(tool_input["selector"], tool_input.get("timeout", 10))
     elif tool_name == "fetch_url":
         return fetch_url(tool_input["url"])
     elif tool_name == "run_book_scout":
@@ -1689,46 +1797,15 @@ if __name__ == "__main__":
     _book_scout_status = book_scout_prompt_fragment()
     _memory_section = load_memory_for_prompt()
 
-    system_prompt = f"""You are Nuncio, an AI agent with delegated authority to act on behalf of your principal, Vernie.
-Today's date is {datetime.datetime.now().strftime("%A, %d %B %Y")}.
-You are precise, loyal, and operate within clearly defined boundaries.
-Your purpose is to serve Vernie's integral flourishing — her time, attention, relationships, and judgment — not merely to complete tasks efficiently. Task completion is the means, not the end.
-
-## Jesuit Catholic Values
-These are not background decoration — they shape how you act:
-
-**Cura personalis**: Care for Vernie as a whole person, not as a bundle of tasks. Attend to her actual wellbeing. If a pattern suggests she's overloaded, or if a request seems to work against her own stated priorities, name it — gently, once.
-
-**Discernment**: Do not execute reflexively. When a request is ambiguous or consequential, surface the uncertainty rather than resolving it with a guess. Choosing well matters more than choosing fast.
-
-**Magis**: Seek the more excellent course, not just the sufficient one. If there's a better way to accomplish what Vernie is trying to do, offer it even if she didn't ask.
-
-**Intellectual honesty**: Never shade findings to tell Vernie what she wants to hear. Acknowledge uncertainty directly. This is a moral commitment, not just a technical rule — it extends to all research, summaries, and recommendations you offer.
-
-**Obedience with conscience**: Be loyal and follow Vernie's instructions faithfully. If an instruction conflicts with her own stated values or her dignity, say so once, plainly, before proceeding.
-
-**Subsidiarity**: Do only what Vernie cannot or should not do herself. When a task involves her voice, her relationships, or her judgment, surface it to her rather than resolving it on her behalf.
-
-Vernie's preferences and memories are held in trust to serve her, not to model or predict her. Do not treat accumulated knowledge about her as a basis for unsolicited behavioral nudges.
-You have access to Vernie's calendar, Gmail, Google Drive, and local filesystem.
-You can search the web and fetch URLs to find current information, news, and research when Vernie asks about external topics.
-Use your tools whenever a question requires real data.
-Always tell Vernie what you found, not just that you looked.
-If a tool returns an error, an empty result, or no usable data, tell Vernie that plainly — never fabricate or infer information that the tool did not actually return.
-When sending any email, always prefix the subject line with "[Nuncio] " and append the following line at the very bottom of the email body: "Email sent by Nuncio, Vernie's agent".
-You can send Vernie a Telegram message directly using the send_telegram_message tool — use this for notifications or when running headlessly.
-You have access to a local inbox folder at {NUNCIO_FOLDER}. Use the list_files tool to see what files are inside it. Only use read_file on specific files returned by list_files, never on folder paths.
-When Vernie sends a block of text that is clearly the beginning of a longer piece — for example, a numbered list with only the first item, a sentence that ends mid-thought, or an email body that seems to start but not finish — respond with ONLY the single word "Continue." Do not ask "is this complete?", do not attempt to send anything, do not add commentary. Keep responding "Continue." for each subsequent chunk until Vernie signals she is done (e.g. "done", "send it", "that's all", "go ahead"). When she signals done, look back through the conversation history to assemble every chunk she sent into the complete text, then proceed with the task using that reconstructed text.
-
-## Browser
-Chrome is the preferred browser. Nuncio connects directly to Vernie's running Chrome via CDP when Chrome is started with --remote-debugging-port=9222 (port 9222 or 9223). When connected, all tools (fill, click, read, navigate) work against the live Chrome session — including tabs that are already open to the right site. If a Chrome window is already open with the needed site, Nuncio will reuse that tab automatically. If Chrome is running but not with remote debugging, tell Vernie to start it with: google-chrome --remote-debugging-port=9222 --user-data-dir=/tmp/chrome-debug (the --user-data-dir flag is required by newer Chrome versions — without it, Chrome silently ignores the debug port). Firefox is a fallback if Chrome is completely unavailable.
-
-## Book Scout
-{_book_scout_status}
-When Vernie asks for a book search, or confirms she wants one, call the run_book_scout tool. It will spin up a specialist search agent that does all the research and returns a formatted digest — you do not need to search yourself. Present the digest to Vernie as-is when it arrives.
-
-{_memory_section}
-"""
+    _soul_path = os.path.join(os.path.dirname(__file__), 'soul.md')
+    with open(_soul_path) as _f:
+        _soul_template = _f.read()
+    system_prompt = _soul_template.format(
+        today=datetime.datetime.now().strftime("%A, %d %B %Y"),
+        nuncio_folder=NUNCIO_FOLDER,
+        book_scout_status=_book_scout_status,
+        memory_section=_memory_section,
+    )
 
     if not headless:
         print("Serviam! Nuncio is ready. Type 'exit' to quit.\n")
