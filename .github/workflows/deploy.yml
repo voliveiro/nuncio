@@ -18,6 +18,9 @@ jobs:
           script: |
             cd ${{ secrets.HETZNER_REPO_PATH }}
             git pull origin main
+            # Install/update Python deps and the Chromium build Playwright drives
+            venv/bin/pip install -q -r requirements.txt
+            venv/bin/python3 -m playwright install --with-deps chromium
             # Set up weekly book scout cron (Fridays 8am) if not already present
             (crontab -l 2>/dev/null | grep -q 'book_scout_cron') || \
               { crontab -l 2>/dev/null; echo "0 8 * * 5 ${{ secrets.HETZNER_REPO_PATH }}/venv/bin/python3 ${{ secrets.HETZNER_REPO_PATH }}/agents/book_scout_cron.py >> ${{ secrets.HETZNER_REPO_PATH }}/logs/book_scout_cron.log 2>&1"; } | crontab -

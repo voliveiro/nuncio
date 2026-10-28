@@ -607,7 +607,8 @@ def _get_page():
         if not connected:
             if not _cdp_attach_failed_reason:
                 _cdp_attach_failed_reason = f"No Chrome/Chromium found on ports {CDP_PORTS}. Start Chrome with: google-chrome --remote-debugging-port=9222 --user-data-dir=/tmp/chrome-debug"
-            _browser_instance = _playwright_instance.chromium.launch(headless=False)
+            # Headless when there is no display (e.g. the Hetzner server)
+            _browser_instance = _playwright_instance.chromium.launch(headless=not os.environ.get("DISPLAY"))
             _page_instance = _browser_instance.new_page()
             _browser_owned = True
     return _page_instance
