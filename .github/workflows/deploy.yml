@@ -16,6 +16,8 @@ jobs:
           username: ${{ secrets.HETZNER_USER }}
           key: ${{ secrets.HETZNER_SSH_KEY }}
           script: |
+            # Stop at the first failing step so a failed pull fails the deploy
+            set -e
             cd ${{ secrets.HETZNER_REPO_PATH }}
             git pull origin main
             # Install/update Python deps and the Chromium build Playwright drives
