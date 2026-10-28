@@ -73,7 +73,12 @@ def load_history():
                     raise ValueError("Malformed message in history")
                 if isinstance(msg['content'], str):
                     raise ValueError("Content is a plain string, not a list of blocks")
-            return history
+                # The API rejects empty or whitespace-only text blocks
+                msg['content'] = [
+                    b for b in msg['content']
+                    if not (isinstance(b, dict) and b.get('type') == 'text' and not b.get('text', '').strip())
+                ]
+            return [msg for msg in history if msg['content']]
         except (json.JSONDecodeError, ValueError) as e:
             print(f"[Nuncio] Warning: conversation history was corrupted and has been reset. ({e})")
             save_history([])
@@ -538,6 +543,45 @@ def _detect_browser_on_port(port):
     return None
 
 
+# Persistent profile so logins survive between launches (not /tmp, which is wiped on reboot)
+NUNCIO_CHROME_PROFILE = os.path.expanduser("~/.config/nuncio-chrome")
+
+
+def _launch_chrome():
+    """Start Chrome with remote debugging on CDP_PORTS[0] if nothing is listening there.
+    Returns True once Chrome answers on the port. Only runs when there is a display."""
+    import shutil
+    import socket as _sock
+    port = CDP_PORTS[0]
+    if _detect_browser_on_port(port) == "chrome":
+        return True
+    if not os.environ.get("DISPLAY"):
+        return False
+    try:
+        s = _sock.create_connection(("127.0.0.1", port), timeout=0.5)
+        s.close()
+        return False  # port taken by something else (e.g. Firefox)
+    except OSError:
+        pass
+    binary = next((b for b in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser")
+                   if shutil.which(b)), None)
+    if binary is None:
+        return False
+    os.makedirs(NUNCIO_CHROME_PROFILE, exist_ok=True)
+    # Detached so Chrome keeps running after Nuncio exits
+    subprocess.Popen(
+        [binary, f"--remote-debugging-port={port}", f"--user-data-dir={NUNCIO_CHROME_PROFILE}",
+         "--no-first-run", "--no-default-browser-check"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+    )
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        if _detect_browser_on_port(port) == "chrome":
+            return True
+        time.sleep(0.5)
+    return False
+
+
 def _firefox_list_tabs(port):
     """Return page/tab target dicts from Firefox CDP."""
     try:
@@ -578,6 +622,7 @@ def _get_page():
     import socket
     from playwright.sync_api import sync_playwright
     if _playwright_instance is None:
+        _launch_chrome()
         _playwright_instance = sync_playwright().start()
         connected = False
         for port in CDP_PORTS:
@@ -606,7 +651,7 @@ def _get_page():
                 _cdp_attach_failed_reason = f"port {port} is open but CDP attach failed: {e}"
         if not connected:
             if not _cdp_attach_failed_reason:
-                _cdp_attach_failed_reason = f"No Chrome/Chromium found on ports {CDP_PORTS}. Start Chrome with: google-chrome --remote-debugging-port=9222 --user-data-dir=/tmp/chrome-debug"
+                _cdp_attach_failed_reason = f"No Chrome/Chromium found on ports {CDP_PORTS} and auto-launch failed (no display, or port {CDP_PORTS[0]} is taken)."
             # Headless when there is no display (e.g. the Hetzner server)
             _browser_instance = _playwright_instance.chromium.launch(headless=not os.environ.get("DISPLAY"))
             _page_instance = _browser_instance.new_page()
@@ -716,7 +761,7 @@ def _chrome_available():
             continue
         if _detect_browser_on_port(port) == "chrome":
             return True
-    return False
+    return _launch_chrome()
 
 
 def browser_navigate(url):
@@ -724,8 +769,10 @@ def browser_navigate(url):
     try:
         import socket
         from playwright.sync_api import sync_playwright
-        windows = _wmctrl_windows()
         domain = _get_domain(url)
+        if _browser_instance is None:
+            _launch_chrome()
+        windows = _wmctrl_windows()
 
         # 1. Chrome CDP (preferred) — attach to existing Chrome with --remote-debugging-port
         for port in CDP_PORTS:
@@ -1818,6 +1865,8 @@ if __name__ == "__main__":
             else:
                 # user_input = input("You: ")  # original
                 user_input = input("You: ")
+                if not user_input.strip():
+                    continue
 
             if not headless and user_input.lower() == "exit":
                 print("Ite in pace. Nuncio signing off.")
@@ -1909,7 +1958,7 @@ if __name__ == "__main__":
 
                     serialized = []
                     for block in response.content:
-                        if block.type == "text" and block.text:
+                        if block.type == "text" and block.text.strip():
                             serialized.append({"type": "text", "text": block.text})
                         elif block.type == "tool_use":
                             serialized.append({"type": "tool_use", "id": block.id, "name": block.name, "input": block.input})
@@ -1924,7 +1973,7 @@ if __name__ == "__main__":
 
                 else:
                     reply = next((b.text for b in response.content if b.type == "text"), "")
-                    if reply:
+                    if reply.strip():
                         conversation_history.append({
                             "role": "assistant",
                             "content": [{"type": "text", "text": reply}]
